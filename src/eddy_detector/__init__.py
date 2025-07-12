@@ -1,0 +1,1 @@
+from .simclr_detector import SimCLREddyDetector

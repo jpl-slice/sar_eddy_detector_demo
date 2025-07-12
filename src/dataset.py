@@ -3,6 +3,7 @@ import glob
 import os
 import shutil
 import tempfile
+from typing import Callable, Dict, Optional
 
 import geopandas as gpd
 import numpy as np
@@ -10,37 +11,6 @@ import rasterio
 import torch
 from rasterio import features, windows
 from torch.utils.data import Dataset
-from torchvision import transforms
-
-
-sar_min = 2.341661e-09
-sar_max = 1123.6694
-
-
-class SARImageNormalizer:
-    """Handles normalization operations for SAR imagery."""
-
-    @staticmethod
-    def global_min_max_normalize(tensor: torch.Tensor) -> torch.Tensor:
-        """Apply global min-max normalization based on dataset statistics."""
-        return transforms.Normalize(mean=sar_min, std=sar_max - sar_min)(tensor)
-
-    @staticmethod
-    def per_tile_normalize(tensor: torch.Tensor) -> torch.Tensor:
-        """Apply per-tile normalization to handle local contrast."""
-        # Exclude values of -9999 from the img array
-        valid_values = tensor[tensor != -9999]
-        valid_min, valid_max = valid_values.min(), valid_values.max()
-        return transforms.Normalize(mean=valid_min, std=valid_max - valid_min + 1e-7)(
-            tensor
-        )
-
-    @staticmethod
-    def boost_dark_images(tensor: torch.Tensor) -> torch.Tensor:
-        """Boost dark images to improve contrast."""
-        if tensor.mean() < 1e-5:
-            tensor = tensor * 10
-        return tensor
 
 
 class SARTileDataset(Dataset):
@@ -56,39 +26,33 @@ class SARTileDataset(Dataset):
 
     def __init__(
         self,
-        geotiff_dir: str,
-        land_shapefile: str,
-        window_size: int = 448,
-        stride_factor: float = 0.5,
-        land_threshold: float = 0.8,
-        nodata_threshold: float = 0.9,
-        var_threshold: float = 1e-5,
-        transform=None,
-        preprocessed_dir: str = None,
-        force_preprocess: bool = False,
+        dataset_config: Dict,
+        transform: Optional[Callable] = None,
     ):
         """
         Args:
-            geotiff_dir: Directory containing raw GeoTIFF files.
-            land_shapefile: Path to land polygon shapefile.
-            window_size: Size of tiles to extract (square).
-            stride_factor: Stride as a fraction of window size.
-            land_threshold: Maximum fraction of land pixels allowed.
-            nodata_threshold: Maximum fraction of no-data pixels allowed.
-            var_threshold: Minimum variance required for valid tiles.
-            transform: PyTorch transforms to apply to tiles.
-            preprocessed_dir: Optional directory for preprocessed (land-masked) GeoTIFFs.
-                              If provided, the dataset will use these files.
-            force_preprocess: If True, reprocess raw files even if preprocessed files exist.
+            dataset_config: A dictionary containing all dataset parameters.
+                - geotiff_dir: Directory containing raw GeoTIFF files.
+                - land_shapefile: Path to land polygon shapefile.
+                - window_size: Size of tiles to extract (square).
+                - stride_factor: Stride as a fraction of window size.
+                - land_threshold: Maximum fraction of land pixels allowed.
+                - nodata_threshold: Maximum fraction of no-data pixels allowed.
+                - var_threshold: Minimum variance required for valid tiles.
+                - preprocessed_dir: Optional directory for preprocessed (land-masked) GeoTIFFs.
+                - force_preprocess: If True, reprocess raw files even if preprocessed files exist.
+            transform: PyTorch transforms to apply to tiles (composed outside).
         """
-        self.geotiff_dir = geotiff_dir
-        self.land_shapefile = land_shapefile
-        self.window_size = window_size
-        self.stride = int(stride_factor * window_size)
-        self.land_threshold = land_threshold
-        self.nodata_threshold = nodata_threshold
-        self.var_threshold = var_threshold
-        self.preprocessed_dir = preprocessed_dir
+        # Unpack config dictionary
+        self.geotiff_dir = dataset_config["geotiff_dir"]
+        self.land_shapefile = dataset_config["land_shapefile"]
+        self.window_size = dataset_config.get("window_size", 448)
+        self.stride = int(dataset_config.get("stride_factor", 0.5) * self.window_size)
+        self.land_threshold = dataset_config.get("land_threshold", 0.8)
+        self.nodata_threshold = dataset_config.get("nodata_threshold", 0.9)
+        self.var_threshold = dataset_config.get("var_threshold", 1e-5)
+        self.preprocessed_dir = dataset_config.get("preprocessed_dir")
+        force_preprocess = dataset_config.get("force_preprocess", False)
 
         # Dictionary to cache persistent file handles (each worker gets its own instance)
         self._file_handles = {}
@@ -110,8 +74,8 @@ class SARTileDataset(Dataset):
         # If preprocessed_dir is provided, ensure it exists and process files if needed
         if self.preprocessed_dir is not None:
             os.makedirs(self.preprocessed_dir, exist_ok=True)
-            raw_files = sorted(glob.glob(os.path.join(geotiff_dir, "*.tif")))
-            jp2_files = sorted(glob.glob(os.path.join(geotiff_dir, "*.jp2")))
+            raw_files = sorted(glob.glob(os.path.join(self.geotiff_dir, "*.tif")))
+            jp2_files = sorted(glob.glob(os.path.join(self.geotiff_dir, "*.jp2")))
             raw_files = raw_files + jp2_files
             self.files = []
 
@@ -128,19 +92,17 @@ class SARTileDataset(Dataset):
 
             # Process files in parallel if any need preprocessing
             if preprocess_tasks:
-                num_cpus = os.cpu_count() - 1 or 1  # or 1 in case cpu_count() is none
-                max_workers = max(1, min(num_cpus, len(preprocess_tasks)))
+                cpus = os.cpu_count()
+                workers = max(1, min((cpus - 1 if cpus else 1), len(preprocess_tasks)))
                 print(
-                    f"Preprocessing {len(preprocess_tasks)} files using {max_workers} workers"
+                    f"Preprocessing {len(preprocess_tasks)} files using {workers} workers"
                 )
 
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=max_workers
-                ) as executor:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as exc:
                     # Submit all preprocessing jobs
                     futures = {}
                     for raw_file, pre_file, basename in preprocess_tasks:
-                        future = executor.submit(
+                        future = exc.submit(
                             self._apply_land_mask_and_scaling, raw_file, pre_file
                         )
                         futures[future] = basename
@@ -154,9 +116,9 @@ class SARTileDataset(Dataset):
                         except Exception as e:
                             print(f"Error preprocessing {base}: {str(e)}")
         else:
-            self.files = sorted(glob.glob(os.path.join(geotiff_dir, "*.tif")))
+            self.files = sorted(glob.glob(os.path.join(self.geotiff_dir, "*.tif")))
             if not self.files:
-                raise ValueError(f"No GeoTIFF files found in {geotiff_dir}")
+                raise ValueError(f"No GeoTIFF files found in {self.geotiff_dir}")
 
         print(
             f"Found {len(self.files)} GeoTIFF files (preprocessed: {self.preprocessed_dir is not None})"
@@ -215,7 +177,8 @@ class SARTileDataset(Dataset):
         If files are preprocessed, land masking is already done so __getitem__ can be simplified.
         """
         all_tile_indices = []
-        max_workers = max(1, min(os.cpu_count() - 1 or 1, len(self.files)))
+        num_cpus = os.cpu_count()
+        max_workers = max(1, min((num_cpus - 1 if num_cpus else 1), len(self.files)))
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=max_workers
         ) as executor:
@@ -237,9 +200,9 @@ class SARTileDataset(Dataset):
         Process a single file to build tile indices.
         When using preprocessed files, land pixels have already been masked.
         """
-        print(
-            f"Processing file {file_idx+1}/{len(self.files)}: {os.path.basename(file_path)}"
-        )
+        # print(
+        #     f"Processing file {file_idx+1}/{len(self.files)}: {os.path.basename(file_path)}"
+        # )
         file_tile_index = []
         try:
             with rasterio.open(file_path) as src:
@@ -313,6 +276,8 @@ class SARTileDataset(Dataset):
         return comp_data
 
     def __getitem__(self, idx):
+        if idx >= len(self.tile_index):
+            raise IndexError(f"Index out of range ({idx} >= {len(self.tile_index)})")
         tile_info = self.tile_index[idx]
         file_path = tile_info["file_path"]
         window = tile_info["window"]
@@ -327,22 +292,17 @@ class SARTileDataset(Dataset):
         nodata_val = fh.nodata if fh.nodata is not None else -9999
         data[data == nodata_val] = np.nan
 
+        if self.transform:
+            tensor_data = self.transform(data)
+        else:
+            tensor_data = torch.from_numpy(data).unsqueeze(0)
+
+        # --- Metadata Extraction ---
         window_transform = windows.transform(window, fh.transform)
         filename = os.path.basename(file_path)
         left, top = window_transform * (0, 0)
         right, bottom = window_transform * (self.window_size, self.window_size)
         bbox = torch.tensor((left, bottom, right, top))
-
-        # bbox_latlon = bbox
-
-        # clip 0 - 1b
-        tensor_data = np.clip(data, 0, 1)
-
-        if self.transform:
-            tensor_data = self.transform(tensor_data)
-        else:
-            tensor_data = torch.from_numpy(data).unsqueeze(0)
-
         window_transform = [
             getattr(window_transform, x) for x in ["a", "b", "c", "d", "e", "f"]
         ]  # Affine transform
@@ -359,9 +319,10 @@ class SARTileDataset(Dataset):
         """
         Close all persistent file handles.
         """
-        for fh in self._file_handles.values():
-            fh.close()
-        self._file_handles = {}
+        if hasattr(self, "_file_handles"):
+            for fh in self._file_handles.values():
+                fh.close()
+            self._file_handles = {}
 
     def __del__(self):
         self.close()

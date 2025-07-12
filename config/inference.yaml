@@ -2,24 +2,25 @@ method: "inference"
 num_channels: 1
 ngpus_per_node: 1
 
-# Dataset options
-dataset: "sar_tiles"
-geotiff_dir: "data/" # Override to point to example data
-preprocessed_dir: "data/"
-output_dir: "output" # Override output dir
-identification_table_path: "output/positive_eddy_identifications.csv" # Override output path
+# Class names for dynamic loading
+detector_class_name: "SimCLREddyDetector"
 
-land_shapefile: "data/land_mask/ne_10m_land.shp"
-window_size: 700
-stride_factor: 0.25
-land_threshold: 0.8
-nodata_threshold: 0.9
-var_threshold: 1.0e-5
+# Dataset parameters (nested under a single key)
+dataset_params:
+  dataset_class_name: "src.dataset.SARTileDataset"
+  geotiff_dir: "data/"
+  preprocessed_dir: "data/"
+  land_shapefile: "data/land_mask/ne_10m_land.shp"
+  window_size: 700
+  stride_factor: 0.25
+  land_threshold: 0.8
+  nodata_threshold: 0.9
+  var_threshold: 1.0e-5
 
 # Model options
 arch: "r50_1x_sk0"
 num_classes: 2
-pretrain: "model_checkpoints/checkpoint.tar" # Edwin renamed checkpoint_ybkalzbi.tar to checkpoint.tar
+pretrain: "model_checkpoints/checkpoint.tar"
 
 # Inference options
 batch_size: 128
