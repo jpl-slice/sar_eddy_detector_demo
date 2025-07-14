@@ -61,19 +61,6 @@ class BaseEddyDetector(abc.ABC):
         self._merged_csv_path: Optional[Path] = None
 
     @abc.abstractmethod
-    def _setup_model(self) -> bool:
-        """
-        Abstract method for subclasses to set up their specific model(s) and any
-        related components (like a scikit-learn pipeline).
-
-        This method should populate `self.model` and any other necessary attributes.
-
-        Returns:
-            True if setup is successful, False otherwise.
-        """
-        pass
-
-    @abc.abstractmethod
     def _create_transform(self) -> Optional[transforms.Compose]:
         """
         Abstract method for subclasses to create the specific transformation pipeline
@@ -120,6 +107,36 @@ class BaseEddyDetector(abc.ABC):
                 print(f"[{cls_name}] {name.capitalize()} setup failed.")
                 return False
         return True
+
+    def _setup_model(self) -> bool:
+        """
+        Boilerplate to load the model. Subclasses should call this and handle any
+        additional setup (e.g., pipelines, transforms) as needed.
+        """
+        self.model, self.input_size, self.interpolation_mode = self._load_model()
+        return self.model is not None
+
+    def _load_model(self):
+        """
+        Dynamically import and initialize the model based on config.
+        Returns:
+            model, input_size, interpolation_mode on success;
+            (None, None, None) on failure.
+        """
+        path = getattr(self.config, "model_loader_class", None)
+        if not path:
+            print(
+                f"[{self.class_name}] Error: 'model_loader_class' not specified in config."
+            )
+            return None, None, None
+        try:
+            Loader = load_class(path, default_pkg="src.models")
+            model, size, interp = Loader.load(self.config)
+            return model, size, interp
+        except Exception as e:
+            print(f"[{self.class_name}] Error loading model '{path}': {e}")
+            traceback.print_exc()
+            return None, None, None
 
     def _create_and_assign_transform(self) -> bool:
         self.transform = self._create_transform()
