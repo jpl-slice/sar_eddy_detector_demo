@@ -5,7 +5,7 @@ import sys
 # Add repo root to path for relative imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.utils import parse_args_from_yaml
+from src.utils import load_class, parse_args_from_yaml
 
 
 def main():
@@ -24,20 +24,14 @@ def main():
 
 def initialize_detector(args):
     """Dynamically imports and initializes the detector class based on config."""
+    detector_class = args.detector_class_name  # shorter alias
     try:
-        # If no module path is provided, assume the detector is in src.eddy_detector
-        if "." in args.detector_class_name:
-            module_name, class_name = args.detector_class_name.rsplit(".", 1)
-        else:
-            module_name = "src.eddy_detector"
-            class_name = args.detector_class_name
-
-        DetectorClass = getattr(importlib.import_module(module_name), class_name)
+        DetectorClass = load_class(detector_class, default_pkg="src.eddy_detector")
         detector = DetectorClass(args)
-        print(f"Successfully instantiated detector: {args.detector_class_name}")
+        print(f"Successfully instantiated detector: {detector_class}")
     except (AttributeError, ImportError) as e:
         print(
-            f"Error: Could not find or import the detector class '{args.detector_class_name}'. Check config.yaml."
+            f"Error: Could not find or import the detector class '{detector_class}'. Check config.yaml."
         )
         print(f"Details: {e}")
         sys.exit(1)

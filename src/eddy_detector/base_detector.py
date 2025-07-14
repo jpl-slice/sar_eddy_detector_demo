@@ -17,7 +17,7 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 
 from src.dataset import SARTileDataset
-from src.utils import merge_csv_bboxes, parse_bbox
+from src.utils import load_class, merge_csv_bboxes, parse_bbox
 from src.visualize_eddy_bbox import create_preview_with_boxes
 
 
@@ -138,24 +138,17 @@ class BaseEddyDetector(abc.ABC):
             return False
 
         try:
-            # Dynamically import the dataset class
-            module_path, class_name = self.config.dataset_params[
-                "dataset_class_name"
-            ].rsplit(".", 1)
-            module = importlib.import_module(module_path)
-            DatasetClass = getattr(module, class_name)
-
+            data_config = self.config.dataset_params
+            class_name = data_config["dataset_class_name"]
+            DatasetClass = load_class(class_name, default_pkg="src.dataset")
             # Instantiate the dataset with its specific config and the shared transform
-            self.dataset = DatasetClass(
-                dataset_config=self.config.dataset_params, transform=self.transform
-            )
-            print(
-                f"[{self.class_name}] Successfully instantiated dataset: {class_name}"
-            )
+            # Note that the API for any dataset class is: __init__(self, config: Dict, transform: Optional[Callable] = None)
+            self.dataset = DatasetClass(data_config, transform=self.transform)
+            print(f"[{self.class_name}] Successfully created dataset: {class_name}")
             return True
         except (ImportError, AttributeError) as e:
             print(
-                f"[{self.class_name}] Error: Could not import or find dataset class '{self.config.dataset_params["dataset_class_name"]}'. Details: {e}"
+                f"[{self.class_name}] Error: Could not import or find dataset class {class_name}. Details: {e}"
             )
             return False
         except Exception as e:
