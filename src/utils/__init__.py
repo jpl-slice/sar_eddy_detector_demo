@@ -7,3 +7,4 @@ from .bbox import (
     parse_bbox,
 )
 from .config import parse_args_from_yaml, yaml_config_hook
+from .importer import load_class
