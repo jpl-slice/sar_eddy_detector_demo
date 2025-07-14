@@ -1,1 +1,2 @@
 from .simclr_detector import SimCLREddyDetector
+from .timm_xgboost_detector import TimmXGBoostEddyDetector

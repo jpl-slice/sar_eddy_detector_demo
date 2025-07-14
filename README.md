@@ -74,7 +74,7 @@ For full details on installation—including setting up with Conda or venv/pip a
 If you already have Conda on your system, you can do:
 
 ```bash
-conda create --name sar_eddy_env python=3.10 pandas rasterio libgdal "geopandas>1.0.0" shapely tqdm pyyaml pytorch torchvision -c conda-forge
+conda create --name sar_eddy_env python=3.10 pandas rasterio libgdal geopandas shapely tqdm pyyaml pytorch torchvision timm scikit-learn xgboost -c conda-forge
 ```
 
 ## Directory Structure

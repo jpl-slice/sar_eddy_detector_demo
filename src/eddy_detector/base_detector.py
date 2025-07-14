@@ -36,6 +36,7 @@ class BaseEddyDetector(abc.ABC):
             config: Configuration parameters object containing device, paths, and thresholds.
         """
         self.config = config
+        self.arch = self.config.arch  # Model architecture name
         self.class_name = self.__class__.__name__  # Alias for logging
 
         # Set the device: use the provided device if CUDA is available; otherwise default to CPU
@@ -773,10 +774,10 @@ class BaseEddyDetector(abc.ABC):
             # ax.add_patch(rect)
 
             # Set plot titles and labels
-            # ax.set_title(f"Confidence: {confidence:.3f}")
+            ax.set_title(f"Confidence: {confidence:.3f}")
             ax.set_xlabel("Longitude")
             ax.set_ylabel("Latitude")
-            ax.set_axis_off()
+            # ax.set_axis_off()
             plt.tight_layout()
             plt.savefig(output_path, bbox_inches="tight", pad_inches=0)
             plt.close(fig)
