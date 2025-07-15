@@ -1,3 +1,5 @@
+import logging
+import pickle
 import traceback
 from pathlib import Path
 from typing import Callable, Optional, Tuple
@@ -28,43 +30,42 @@ class TimmXGBoostEddyDetector(BaseEddyDetector):
         pipeline_path = Path(getattr(self.config, "pipeline_path", ""))
         try:
             self.pipeline = joblib.load(pipeline_path)
-            print(
-                f"[{self.class_name}] Pipeline loaded: {type(self.pipeline).__name__}"
-            )
-        except Exception as e:
-            print(f"[{self.class_name}] Error loading pipeline: {e}")
-            traceback.print_exc()
+            self.logger.info(f"Pipeline loaded: {type(self.pipeline).__name__}")
+        except (IOError, joblib.externals.loky.process_executor.BrokenProcessPool, pickle.UnpicklingError) as e:
+            self.logger.error(f"Error loading pipeline: {e}", exc_info=True)
             return False
-
+        except Exception:
+            self.logger.error("An unexpected error occurred while loading the pipeline.", exc_info=True)
+            return False
         return True
 
     def _create_transform(self) -> Optional[Callable]:
         """Creates the transform pipeline using TIMM helpers."""
         if self.model is None or self.input_size is None:
-            print(
-                f"[{self.class_name}] Error: TIMM model must be loaded first to determine transforms."
+            self.logger.error(
+                "TIMM model must be loaded first to determine transforms."
             )
             return None
-        print(
-            f"[{self.class_name}] Creating transform pipeline using timm helpers for model: {self.arch}"
+        self.logger.info(
+            f"Creating transform pipeline using timm helpers for model: {self.arch}"
         )
         try:
             data_config = timm.data.resolve_model_data_config(self.model)
             transform = timm.data.create_transform(**data_config, is_training=False)
-            print(f"  TIMM data config resolved: {data_config}")
-            print(f"  TIMM transform pipeline created.")
+            self.logger.info(f"TIMM data config resolved: {data_config}")
+            self.logger.info("TIMM transform pipeline created.")
 
             default_config = self.model.default_cfg
             # if default_config.get("fixed_input_size", False):
             #     data_config["input_size"] = (data_config["input_size"][0], self.config.window_size, self.config.window_size)
-            #     print(f"    This model supports variable input size, so we set it to {data_config['input_size']}.")
-            #     print(f"    Updated data config: {data_config}")
+            #     self.logger.info(f"    This model supports variable input size, so we set it to {data_config['input_size']}.")
+            #     self.logger.info(f"    Updated data config: {data_config}")
 
             first_two_transforms = [ClipNormalizeCastToUint8(), transforms.ToPILImage()]
 
             # Check if Grayscale conversion needs to be added PREPENDED
             # Assumes dataset provides PIL Image 'L' mode
-            self.prepend_grayscale_if_needed(data_config, transform)
+            self._prepend_grayscale_if_needed(data_config, transform)
             mask_config = data_config.copy()
             mask_config.update(
                 {
@@ -76,41 +77,44 @@ class TimmXGBoostEddyDetector(BaseEddyDetector):
             mask_transforms = timm.data.create_transform(
                 **mask_config, is_training=False
             )
-            self.prepend_grayscale_if_needed(mask_config, mask_transforms)
+            self._prepend_grayscale_if_needed(mask_config, mask_transforms)
             transform.transforms.insert(0, ClipNormalizeCastToUint8())
             transform.transforms.insert(1, transforms.ToPILImage())
-            print(f"Using the following transforms: {transform.transforms}")
-            return self._make_combined_transform(transform, mask_transforms)
-        except Exception as e:
-            print(
-                f"[{self.class_name}] Error creating TIMM transform: {e}. Check timm version compatibility."
+            self.logger.info(f"Using the following transforms: {transform.transforms}")
+            return self._make_combined_transform(
+                transform, mask_transforms, self.config.nodata_value
             )
-            traceback.print_exc()
+        except (RuntimeError, ValueError) as e:
+            self.logger.error(
+                f"Error creating TIMM transform: {e}. Check timm version compatibility.",
+                exc_info=True,
+            )
             return None
 
-    def prepend_grayscale_if_needed(self, data_config, transform):
+    def _prepend_grayscale_if_needed(self, data_config, transform):
         if data_config.get("input_size", [3])[0] == 3:  # If model expects 3 channels
             has_grayscale = any(
                 isinstance(t, transforms.Grayscale) and t.num_output_channels == 3
                 for t in transform.transforms
             )
             if not has_grayscale:
-                print(
-                    "  Prepending Grayscale(num_output_channels=3) to the transform pipeline."
+                self.logger.info(
+                    "Prepending Grayscale(num_output_channels=3) to the transform pipeline."
                 )
                 # Ensure Grayscale is the very first operation on the PIL image
                 transform.transforms.insert(
                     0, transforms.Grayscale(num_output_channels=3)
                 )  # Indicate failure
 
-    def _make_combined_transform(self, img_transform, mask_transform):
+    @staticmethod
+    def _make_combined_transform(img_transform, mask_transform, nodata_value):
         def combined_transform(img):
             arr = np.array(img)
-            condition = (arr == self.config.nodata_value) | np.isnan(arr)
+            condition = (arr == nodata_value) | np.isnan(arr)
             mask = Image.fromarray(condition.astype(np.uint8) * 255)
             img_transformed = img_transform(img)
             mask_transformed = mask_transform(mask)  # This should yield a tensor mask.
-            img_transformed[mask_transformed > 0] = self.config.nodata_value
+            img_transformed[mask_transformed > 0] = nodata_value
             return img_transformed
 
         return combined_transform
@@ -120,7 +124,7 @@ class TimmXGBoostEddyDetector(BaseEddyDetector):
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Extracts features and uses the scikit-learn pipeline for prediction."""
         if self.model is None or self.pipeline is None:
-            print(f"[{self.class_name}] Error: Model and pipeline must be loaded.")
+            self.logger.error("Model and pipeline must be loaded.")
             return None, None
         try:
             # 1. Extract features (runs on self.device)
@@ -142,14 +146,13 @@ class TimmXGBoostEddyDetector(BaseEddyDetector):
                 ]
             else:
                 # If predict_proba is not available, assign fixed confidence
-                print(
-                    f"Warning: Pipeline {type(self.pipeline)} does not have 'predict_proba'. Assigning confidence=1.0."
+                self.logger.warning(
+                    f"Pipeline {type(self.pipeline)} does not have 'predict_proba'. Assigning confidence=1.0."
                 )
                 probabilities_np = np.ones_like(predictions_np, dtype=float)
 
             return predictions_np, probabilities_np
 
-        except Exception as e:
-            print(f"[{self.class_name}] Error during TIMM+Pipeline prediction: {e}")
-            traceback.print_exc()
+        except (RuntimeError, ValueError) as e:
+            self.logger.error(f"Error during TIMM+Pipeline prediction: {e}", exc_info=True)
             return None, None  # Indicate failure

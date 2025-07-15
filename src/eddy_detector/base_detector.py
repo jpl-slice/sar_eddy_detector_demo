@@ -1,5 +1,6 @@
 import abc
 import importlib
+import logging
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,6 +18,7 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 
 from src.dataset import SARTileDataset
+from src.eddy_detector.preview_generator import PreviewGenerator
 from src.utils import load_class, merge_csv_bboxes, parse_bbox
 from src.visualize_eddy_bbox import create_preview_with_boxes
 
@@ -45,7 +47,7 @@ class BaseEddyDetector(abc.ABC):
             if torch.cuda.is_available() and config.device == "cuda"
             else "cpu"
         )
-        print(f"[{self.class_name}] Using device: {self.device}")
+        self.logger.info(f"Using device: {self.device}")
 
         # fmt: off
         self.model: Optional[torch.nn.Module] = None  # PyTorch model (e.g., end-to-end or feature extractor)
@@ -60,6 +62,7 @@ class BaseEddyDetector(abc.ABC):
         # Paths to generated result files (set after saving)
         self._base_csv_path: Optional[Path] = None
         self._merged_csv_path: Optional[Path] = None
+        self.preview_generator = PreviewGenerator(config, self)
 
     @abc.abstractmethod
     def _create_transform(self) -> Optional[transforms.Compose]:
@@ -101,11 +104,10 @@ class BaseEddyDetector(abc.ABC):
             ("transforms", self._create_and_assign_transform),
             ("dataset", self.setup_dataset),
         ]
-        cls_name = self.__class__.__name__
         for name, step_func in steps:
-            print(f"[{cls_name}] Setting up {name}...")
+            self.logger.info(f"Setting up {name}...")
             if not step_func():
-                print(f"[{cls_name}] {name.capitalize()} setup failed.")
+                self.logger.error(f"{name.capitalize()} setup failed.")
                 return False
         return True
 
@@ -126,17 +128,14 @@ class BaseEddyDetector(abc.ABC):
         """
         path = getattr(self.config, "model_loader_class", None)
         if not path:
-            print(
-                f"[{self.class_name}] Error: 'model_loader_class' not specified in config."
-            )
+            self.logger.error("'model_loader_class' not specified in config.")
             return None, None, None
         try:
             Loader = load_class(path, default_pkg="src.models")
             model, size, interp = Loader.load(self.config)
             return model, size, interp
-        except Exception as e:
-            print(f"[{self.class_name}] Error loading model '{path}': {e}")
-            traceback.print_exc()
+        except Exception:
+            self.logger.error(f"Error loading model '{path}'", exc_info=True)
             return None, None, None
 
     def _create_and_assign_transform(self) -> bool:
@@ -150,8 +149,8 @@ class BaseEddyDetector(abc.ABC):
             True if dataset is set up successfully; False otherwise.
         """
         if self.transform is None:
-            print(
-                f"[{self.class_name}] Error: Transform must be created before setting up dataset."
+            self.logger.error(
+                "Transform must be created before setting up dataset."
             )
             return False
 
@@ -162,18 +161,15 @@ class BaseEddyDetector(abc.ABC):
             # Instantiate the dataset with its specific config and the shared transform
             # Note that the API for any dataset class is: __init__(self, config: Dict, transform: Optional[Callable] = None)
             self.dataset = DatasetClass(data_config, transform=self.transform)
-            print(f"[{self.class_name}] Successfully created dataset: {class_name}")
+            self.logger.info(f"Successfully created dataset: {class_name}")
             return True
         except (ImportError, AttributeError) as e:
-            print(
-                f"[{self.class_name}] Error: Could not import or find dataset class {class_name}. Details: {e}"
+            self.logger.error(
+                f"Could not import or find dataset class {class_name}. Details: {e}"
             )
             return False
-        except Exception as e:
-            print(
-                f"[{self.class_name}] Error: Failed to initialize dataset. Details: {e}"
-            )
-            traceback.print_exc()
+        except Exception:
+            self.logger.error("Failed to initialize dataset.", exc_info=True)
             return False
 
     def run_inference(self) -> None:
@@ -182,7 +178,7 @@ class BaseEddyDetector(abc.ABC):
         """
         # Ensure dataset has been initialized.
         if self.dataset is None:
-            print(f"[{self.class_name}] Dataset not initialized. Aborting inference.")
+            self.logger.error("Dataset not initialized. Aborting inference.")
             return
 
         # Create a DataLoader for batching the dataset, with settings based on configuration.
@@ -199,7 +195,7 @@ class BaseEddyDetector(abc.ABC):
         output_dir = Path(self.config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"[{self.class_name}] Running inference...")
+        self.logger.info("Running inference...")
         # Reset any previous detections.
         self.positive_detections = []
         # Wrap dataloader with tqdm for progress reporting.
@@ -215,8 +211,8 @@ class BaseEddyDetector(abc.ABC):
 
                 # If prediction fails for a batch, skip it
                 if predictions is None or probabilities is None:
-                    print(
-                        f"Warning: Skipping batch {batch_idx} due to prediction error."
+                    self.logger.warning(
+                        f"Skipping batch {batch_idx} due to prediction error."
                     )
                     continue
                 # Process each result in the batch
@@ -290,7 +286,7 @@ class BaseEddyDetector(abc.ABC):
 
         # If no positive detections were found, save empty CSVs
         if not self.positive_detections:
-            print(f"[{self.class_name}] No positive detections found.")
+            self.logger.info("No positive detections found.")
             # Use standard bbox column name for empty files too
             df = pd.DataFrame(columns=["filename", bbox_col_name, "confidence"])
             df.to_csv(self._base_csv_path, index=False)
@@ -300,8 +296,8 @@ class BaseEddyDetector(abc.ABC):
             )
             df.to_csv(self._merged_csv_path, index=False)
 
-            print(
-                f"[{self.__class__.__name__}] Saved empty detection files to: {self._base_csv_path} and {self._merged_csv_path}"
+            self.logger.info(
+                f"Saved empty detection files to: {self._base_csv_path} and {self._merged_csv_path}"
             )
             return  # Exit after saving empty files
 
@@ -313,15 +309,13 @@ class BaseEddyDetector(abc.ABC):
         df[["filename", bbox_col_name, "confidence"]].to_csv(
             self._base_csv_path, index=False
         )
-        print(
-            f"[{self.class_name}] Saved {len(self.positive_detections)} positive detections to: {self._base_csv_path}"
+        self.logger.info(
+            f"Saved {len(self.positive_detections)} positive detections to: {self._base_csv_path}"
         )
 
         # --- Attempt to merge bounding boxes ---
         if merge_csv_bboxes is None:
-            print(
-                f"[{self.class_name}] 'merge_csv_bboxes' not available. Skipping merge."
-            )
+            self.logger.warning("'merge_csv_bboxes' not available. Skipping merge.")
             return
 
         try:
@@ -347,156 +341,30 @@ class BaseEddyDetector(abc.ABC):
                 )
                 self._merged_csv_path = self._base_csv_path.parent / merged_filename
                 merged_df.to_csv(self._merged_csv_path, index=False)
-                print(
-                    f"[{self.class_name}] Saved {len(merged_df)} merged detections to: {self._merged_csv_path}"
+                self.logger.info(
+                    f"Saved {len(merged_df)} merged detections to: {self._merged_csv_path}"
                 )
             else:
-                print(f"[{self.class_name}] No overlapping boxes to merge.")
+                self.logger.info("No overlapping boxes to merge.")
 
         except FileNotFoundError:
-            print(
-                f"[{self.class_name}] Error: Base CSV file not found for merging at {self._base_csv_path}"
+            self.logger.error(
+                f"Base CSV file not found for merging at {self._base_csv_path}"
             )
-        except Exception as e:
-            print(f"[{self.class_name}] Error merging bounding boxes: {e}")
-            traceback.print_exc()
-
-    # --- Preview Generation Helper ---
-
-    def _load_and_prepare_detections_df(
-        self, merged: bool, confidence_threshold: Optional[float] = None
-    ) -> Optional[pd.DataFrame]:
-        """Loads and prepares the detection DataFrame from CSV for preview generation."""
-        bbox_col_name = "bbox"  # Standard column name
-
-        if merged:
-            csv_path = self._merged_csv_path
-            source_desc = "merged"
-        else:
-            csv_path = self._base_csv_path
-            source_desc = "individual"
-
-        print(
-            f"[{self.class_name}] Loading {source_desc} detections from {csv_path}..."
-        )
-
-        try:
-            df = pd.read_csv(csv_path)  # type: ignore
-        except (FileNotFoundError, TypeError):
-            print(f"[{self.class_name}] File not found: {csv_path}")
-            return None
-        except pd.errors.EmptyDataError:
-            print(f"[{self.class_name}] No data in CSV file: {csv_path}")
-            return None
-
-        if df.empty:
-            print(
-                f"[{self.class_name}] No detections found in {csv_path}. Skipping preview generation."
-            )
-            return None
-
-        # Ensure the standard bounding box column exists.
-        if bbox_col_name not in df.columns:
-            print(
-                f"[{self.class_name}] Error: Required column '{bbox_col_name}' not found in {csv_path}"
-            )
-            return None
-
-        try:
-            # Parse the bounding box string into a tuple of floats
-            df["bbox_parsed"] = df[bbox_col_name].apply(parse_bbox)
-        except Exception as e:
-            print(f"[{self.class_name}] Error parsing bbox column in {csv_path}: {e}")
-            return None
-
-        # Apply confidence threshold if provided
-        if confidence_threshold is not None:
-            original_count = len(df)
-            # Use .copy() to avoid SettingWithCopyWarning
-            df = df[df["confidence"] >= confidence_threshold].copy()
-            filtered_count = len(df)
-            print(
-                f"[{self.__class__.__name__}] Filtered {original_count - filtered_count} detections below confidence threshold {confidence_threshold}"
-            )
-            if df.empty:
-                print(
-                    f"[{self.__class__.__name__}] No detections remaining after filtering."
-                )
-                # return None
-        return df
+        except Exception:
+            self.logger.error("Error merging bounding boxes", exc_info=True)
 
     # --- Main Preview Methods ---
 
     def create_scene_previews_with_bbox(self, confidence_threshold=0.99, merged=False):
         """
         Create downsampled PNG preview images with bounding boxes drawn.
-
         Args:
             confidence_threshold: Minimum confidence to include a bounding box.
             merged: Boolean flag to indicate whether to use merged detections or individual ones.
         """
-        df = self._load_and_prepare_detections_df(merged, confidence_threshold)
-        if df is None:
-            return
-
-        output_prefix = f"full_scene_previews{'_merged_bbox' if merged else ''}"
-        output_subdir = f"{output_prefix}_{confidence_threshold}"
-        output_dir = Path(self.config.output_dir) / output_subdir
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Ensure that the dataset and its preprocessed directory are available
-        if not self.dataset or not self.dataset.preprocessed_dir:
-            print(
-                f"[{self.class_name}] Dataset or dir containing preprocessed images is required for preview generation."
-            )
-            return
-        # Ensure create_preview_with_boxes is available
-        if create_preview_with_boxes is None:
-            print(
-                f"[{self.class_name}] Error: 'create_preview_with_boxes' utility not available. Skipping scene previews."
-            )
-            return
-
-        source_image_folder = Path(self.dataset.preprocessed_dir)
-        processed_files_count = 0
-
-        # Loop over each unique image file in the detection CSV
-        for filename_base in df["filename"].unique():
-            file_path = source_image_folder / str(filename_base)
-            if not file_path.exists():
-                print(
-                    f"[{self.class_name}] Warning: Source image not found, skipping preview for {filename_base}"
-                )
-                continue
-
-            # Get all boxes for this file
-            file_df = df[df["filename"] == filename_base]
-            boxes_for_file = file_df["bbox_parsed"].tolist()
-            confidences = file_df["confidence"].astype(float).tolist()
-            try:
-                # Generate and save the preview
-                output_image_path = output_dir / f"{file_path.stem}_preview.png"
-                create_preview_with_boxes(
-                    str(file_path),
-                    boxes_for_file,
-                    str(output_image_path),
-                    confidences=confidences,
-                    confidence_threshold=confidence_threshold,
-                    scale_factor=0.1,
-                )
-                processed_files_count += 1
-            except FileNotFoundError:
-                print(
-                    f"[{self.class_name}] Error generating preview: Source file not found at {file_path}"
-                )
-            except Exception as e:
-                print(
-                    f"[{self.class_name}] Error generating preview for {filename_base}: {e}"
-                )
-                traceback.print_exc()
-
-        print(
-            f"[{self.class_name}] Generated {processed_files_count} preview images in {output_dir}"
+        self.preview_generator.create_scene_previews_with_bbox(
+            confidence_threshold, merged
         )
 
     def save_positive_detection_tiles(
@@ -510,7 +378,6 @@ class BaseEddyDetector(abc.ABC):
     ) -> None:
         """
         Create individual preview images for each positive eddy detection.
-
         Args:
             confidence_threshold: Only detections with confidence at or above this value are used.
             merged: Flag to indicate if merged detections should be used.
@@ -518,271 +385,11 @@ class BaseEddyDetector(abc.ABC):
             bbox_buffer_pixels: Number of pixels to extend the bbox in each direction.
             normalize_window: Flag to indicate if the window data should be normalized.
         """
-        df = self._load_and_prepare_detections_df(merged, confidence_threshold)
-        if df is None:
-            return
-
-        # Define the main directory where individual previews will be saved. Use pathlib.
-        # Use parent of base CSV path if available, otherwise use output_dir
-        parent_dir = (
-            self._base_csv_path.parent
-            if self._base_csv_path
-            else Path(self.config.output_dir)
+        self.preview_generator.save_positive_detection_tiles(
+            confidence_threshold,
+            merged,
+            patch_size,
+            bbox_buffer_pixels,
+            normalize_window,
+            split_scenes_into_folders,
         )
-        main_output_dir = (
-            parent_dir / f"positive_detection_tiles_{confidence_threshold}"
-        )
-        main_output_dir.mkdir(parents=True, exist_ok=True)
-
-        if not self.dataset or not self.dataset.preprocessed_dir:
-            print(
-                f"[{self.class_name}] Dataset or dir containing preprocessed images is required for saving individual previews."
-            )
-            return
-
-        source_image_folder = Path(self.dataset.preprocessed_dir)
-
-        # Group detections by filename.
-        grouped_files = df.groupby("filename")
-        print(
-            f"Creating individual previews for {len(df)} detections across {len(grouped_files)} files in {main_output_dir}"
-        )
-
-        # Process each file group
-        for filename, group in grouped_files:
-            if split_scenes_into_folders:
-                file_output_dir = main_output_dir / Path(str(filename)).stem
-                file_output_dir.mkdir(parents=True, exist_ok=True)
-            else:
-                file_output_dir = main_output_dir
-            file_path = source_image_folder / str(filename)
-            if not file_path.exists():
-                print(
-                    f"[{self.class_name}] Warning: Source image not found, skipping tile saving for {filename}"
-                )
-                continue
-
-            try:
-                with rasterio.open(file_path) as src:
-                    is_jp2 = src.driver == "JP2OpenJPEG" or file_path.suffix == ".jp2"
-                    processed_count_for_file = 0
-                    for i, detection in group.iterrows():
-                        bbox = detection["bbox_parsed"]
-                        confidence = detection["confidence"]
-
-                        # Define a unique output path for each detection preview.
-                        output_path = (
-                            file_output_dir
-                            / f"{Path(str(filename)).stem}_detection_{i:03d}_conf_{confidence:.3f}.png"
-                        )
-
-                        # Calculate the window to read from the source image.
-                        try:
-                            window = self._calculate_preview_window(
-                                src.transform,
-                                src.height,
-                                src.width,
-                                bbox,
-                                bbox_buffer_pixels,
-                                patch_size,
-                            )
-                            if window is None:
-                                continue
-
-                            # Read and normalize the data from the calculated window.
-                            window_data = self._read_and_normalize_window_data(
-                                src, window, is_jp2, normalize_window
-                            )
-                            if window_data is None:
-                                continue
-
-                            # Plot and save the individual preview image.
-                            self._plot_and_save_individual_preview(
-                                data=window_data,
-                                src_transform=src.transform,
-                                window=window,
-                                bbox=bbox,
-                                confidence=confidence,
-                                output_path=output_path,
-                            )
-                            processed_count_for_file += 1
-                        except Exception as inner_e:
-                            print(
-                                f"  Error processing detection index {i} for {filename}: {inner_e}"
-                            )
-                            # Optionally add traceback here too
-                            # traceback.print_exc()
-            except Exception as e:
-                print(
-                    f"[{self.class_name}] Error processing file {filename} for individual previews: {e}"
-                )
-                traceback.print_exc()
-
-        print(
-            f"[{self.class_name}] All individual previews attempt finished. Check logs for errors. Output dir: {main_output_dir}"
-        )
-
-    # --- Individual Preview Helpers ---
-
-    def _calculate_preview_window(
-        self, src_transform, src_height, src_width, bbox, buffer, patch_size
-    ) -> Optional[Window]:
-        """Calculates the rasterio window for an individual preview."""
-        try:
-            # Convert geographic bbox to pixel coordinates
-            left, bottom, right, top = bbox
-
-            # Inverse transform converts geographic to image (col, row) coordinates.
-            col_start, row_start = ~src_transform * (left, top)
-            col_end, row_end = ~src_transform * (right, bottom)
-
-            # Ensure coordinates are sorted and add buffer
-            row_start, row_end = sorted(
-                [int(row_start) - buffer, int(row_end) + buffer]
-            )
-            col_start, col_end = sorted(
-                [int(col_start) - buffer, int(col_end) + buffer]
-            )
-
-            # Clip to image boundaries
-            row_start, col_start = max(0, row_start), max(0, col_start)
-            row_end, col_end = min(src_height, row_end), min(src_width, col_end)
-
-            # Ensure minimum patch size
-            row_start, row_end = self._ensure_min_patch_size(
-                row_start, row_end, patch_size, src_height
-            )
-            col_start, col_end = self._ensure_min_patch_size(
-                col_start, col_end, patch_size, src_width
-            )
-
-            window_height, window_width = row_end - row_start, col_end - col_start
-            if window_height <= 0 or window_width <= 0:
-                print(
-                    f"  Warning: Calculated invalid window dimensions ({window_width}x{window_height}) for bbox {bbox}. Skipping."
-                )
-                return None
-            return Window(col_start, row_start, window_width, window_height)
-        except Exception as e:
-            print(f"[{self.class_name}] Error calculating preview window: {e}")
-            return None
-
-    def _ensure_min_patch_size(self, start, end, patch_size, max_size):
-        """Ensure minimum patch size while respecting boundaries."""
-        if end - start >= patch_size:
-            return start, end
-
-        # Try to center the expansion
-        extra = patch_size - (end - start)
-        start = max(0, start - extra // 2)
-        end = min(max_size, start + patch_size)
-        start = max(0, end - patch_size)
-        return start, end
-
-    def _read_and_normalize_window_data(
-        self, src: rasterio.DatasetReader, window: Window, is_jp2: bool, normalize: bool
-    ) -> Optional[np.ndarray]:
-        """Reads data for a given window and optionally normalizes it."""
-        try:
-            if is_jp2:
-                # Ensure dataset and expand_from_jp2 are available
-                if not self.dataset or not hasattr(self.dataset, "expand_from_jp2"):
-                    print(
-                        "  Error: JP2 file detected but dataset or expand_from_jp2 method unavailable."
-                    )
-                    return None
-                data = self.dataset.expand_from_jp2(src, window=window)
-            else:
-                data = src.read(1, window=window).astype(np.float32)
-
-            # Replace nodata values with NaN
-            nodata_val = (
-                src.nodata if src.nodata is not None else -9999
-            )  # Use a common default if not set
-            data[data == nodata_val] = np.nan
-
-            # Optionally normalize
-            if normalize:
-                with np.errstate(
-                    invalid="ignore"
-                ):  # Ignore warnings from all-NaN slices
-                    data_min = np.nanmin(data)
-                    data_max = np.nanmax(data)
-                if (
-                    not np.isnan(data_min)
-                    and not np.isnan(data_max)
-                    and data_max > data_min
-                ):
-                    data = (data - data_min) / (data_max - data_min)
-                elif not np.isnan(data_min):  # Handle case where max == min (flat data)
-                    data.fill(0.0)  # Normalize to 0 if flat and not NaN
-                # else: data remains NaN if all NaN
-
-            return data
-        except Exception as e:
-            print(f"[{self.class_name}] Error reading window data: {e}")
-            return None
-
-    def _plot_and_save_individual_preview(
-        self,
-        data: np.ndarray,
-        src_transform,
-        window: Window,
-        bbox: Tuple,
-        confidence: float,
-        output_path: Path,
-    ) -> None:
-        """Plots and saves an individual detection preview."""
-        try:
-            # Compute window transform and extent for plotting
-            window_transform = rasterio.windows.transform(window, src_transform)
-            left_plot, top_plot = window_transform * (0, 0)
-            right_plot, bottom_plot = window_transform * (window.width, window.height)
-
-            fig, ax = plt.subplots(1, figsize=(10, 10))
-            im = ax.imshow(
-                data,
-                cmap="gray",
-                extent=(left_plot, right_plot, bottom_plot, top_plot),
-                vmin=0.0,
-                # Adjust vmax based on normalization
-                vmax=float(
-                    1.0 if np.nanmax(data) <= 1.0 else np.nanpercentile(data, 98)
-                ),
-            )
-            ax.ticklabel_format(useOffset=False, style="plain")
-
-            # Bbox coordinates in the window's coordinate system
-            # Calculate bbox coordinates relative to the plotted window
-            # left, bottom, right, top = bbox
-            # bbox_patch_left = max(left, left_plot)
-            # bbox_patch_right = min(right, right_plot)
-            # bbox_patch_top = min(top, top_plot)  # Geographic top is min row for plot
-            # bbox_patch_bottom = max(
-            #     bottom, bottom_plot
-            # )  # Geographic bottom is max row for plot
-
-            # # Draw the bounding box rectangle
-            # rect = patches.Rectangle(
-            #     (bbox_patch_left, bbox_patch_bottom),  # Bottom-left corner
-            #     bbox_patch_right - bbox_patch_left,  # Width
-            #     bbox_patch_top - bbox_patch_bottom,  # Height
-            #     linewidth=2,
-            #     edgecolor="r",
-            #     facecolor="none",
-            # )
-            # ax.add_patch(rect)
-
-            # Set plot titles and labels
-            ax.set_title(f"Confidence: {confidence:.3f}")
-            ax.set_xlabel("Longitude")
-            ax.set_ylabel("Latitude")
-            # ax.set_axis_off()
-            plt.tight_layout()
-            plt.savefig(output_path, bbox_inches="tight", pad_inches=0)
-            plt.close(fig)
-        except Exception as e:
-            print(f"[{self.class_name}] Error plotting/saving preview: {e}")
-            traceback.print_exc()
-        finally:
-            plt.close(fig)  # Ensure figure is closed even if error occurs

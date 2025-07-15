@@ -1,3 +1,4 @@
+import logging
 import traceback
 from typing import Optional, Tuple
 
@@ -40,9 +41,8 @@ class SimCLREddyDetector(BaseEddyDetector):
             predictions_np = preds_tensor.cpu().numpy()
 
             return predictions_np, probabilities_np
-        except Exception as e:
-            print(f"[{self.class_name}] Error during SimCLR prediction: {e}")
-            traceback.print_exc()
+        except (RuntimeError, ValueError) as e:
+            self.logger.error(f"Error during SimCLR prediction: {e}", exc_info=True)
             return None, None
 
 
