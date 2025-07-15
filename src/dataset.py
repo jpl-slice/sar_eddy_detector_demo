@@ -24,11 +24,7 @@ class SARTileDataset(Dataset):
 
     """
 
-    def __init__(
-        self,
-        dataset_config: Dict,
-        transform: Optional[Callable] = None,
-    ):
+    def __init__(self, dataset_config: Dict, transform: Optional[Callable] = None):
         """
         Args:
             dataset_config: A dictionary containing all dataset parameters.

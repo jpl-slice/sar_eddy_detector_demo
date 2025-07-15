@@ -7,8 +7,6 @@ import numpy as np
 import timm
 import torch
 from PIL import Image
-from timm.data.config import resolve_data_config
-from timm.data.transforms_factory import create_transform
 from torchvision import transforms
 
 from src.eddy_detector.base_detector import BaseEddyDetector
