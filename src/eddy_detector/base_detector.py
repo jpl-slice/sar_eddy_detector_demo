@@ -18,9 +18,12 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 
 from src.dataset import SARTileDataset
-from src.eddy_detector.preview_generator import PreviewGenerator
 from src.utils import load_class, merge_csv_bboxes, parse_bbox
-from src.visualize_eddy_bbox import create_preview_with_boxes
+from src.visualize_eddy_bbox import (
+    create_preview_with_boxes,
+    generate_scene_previews_with_bboxes,
+    save_positive_detection_tiles,
+)
 
 
 class BaseEddyDetector(abc.ABC):
@@ -62,7 +65,6 @@ class BaseEddyDetector(abc.ABC):
         # Paths to generated result files (set after saving)
         self._base_csv_path: Optional[Path] = None
         self._merged_csv_path: Optional[Path] = None
-        self.preview_generator = PreviewGenerator(config, self)
 
     @abc.abstractmethod
     def _create_transform(self) -> Optional[transforms.Compose]:
@@ -356,16 +358,16 @@ class BaseEddyDetector(abc.ABC):
 
     # --- Main Preview Methods ---
 
-    def create_scene_previews_with_bbox(self, confidence_threshold=0.99, merged=False):
+    def generate_scene_previews_with_bboxes(
+        self, confidence_threshold=0.99, merged=False
+    ):
         """
         Create downsampled PNG preview images with bounding boxes drawn.
         Args:
             confidence_threshold: Minimum confidence to include a bounding box.
             merged: Boolean flag to indicate whether to use merged detections or individual ones.
         """
-        self.preview_generator.create_scene_previews_with_bbox(
-            confidence_threshold, merged
-        )
+        generate_scene_previews_with_bboxes(self, confidence_threshold, merged)
 
     def save_positive_detection_tiles(
         self,
@@ -385,7 +387,8 @@ class BaseEddyDetector(abc.ABC):
             bbox_buffer_pixels: Number of pixels to extend the bbox in each direction.
             normalize_window: Flag to indicate if the window data should be normalized.
         """
-        self.preview_generator.save_positive_detection_tiles(
+        save_positive_detection_tiles(
+            self,
             confidence_threshold,
             merged,
             patch_size,
