@@ -1,27 +1,98 @@
-import concurrent.futures
+import contextlib
 import glob
 import os
-import shutil
-import tempfile
-from typing import Callable, Dict, Optional
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import geopandas as gpd
 import numpy as np
 import rasterio
 import torch
-from rasterio import features, windows
-from torch.utils.data import Dataset
+from rasterio import windows
+from scipy.ndimage import uniform_filter
+from torch.utils.data import Dataset, get_worker_info
+from tqdm.auto import tqdm
+
+from utils.file_preprocess_checker import check_file_is_preprocessed
+
+
+def get_nodata_from_src(src: rasterio.DatasetReader) -> float:
+    # return self.src.nodata if self.src.nodata is not None else -9999.0
+    if src.nodata is not None:
+        return src.nodata
+    else:
+        data = src.read(
+            1,
+            window=windows.Window(0, 0, min(128, src.width), min(128, src.height)),
+            boundless=True,
+            fill_value=0,
+        )  # Read a sample
+        if np.any(data < -9000):  # Heuristic from user
+            # If nodata is not set, assume a common nodata value for SAR data
+            return -9999.0
+        else:
+            return 0.0  # Default to 0 if not otherwise determined.
+
+
+def _process_single_image_wrapper(
+    tif_path: str,
+    win_size: int,
+    stride: int,
+    nodata_threshold: float,
+) -> Tuple[List[rasterio.windows.Window], List[str]]:
+    """
+    Stand-alone so it can run in a different process.
+    Re-creates only the cheap state it needs; avoids pickling the whole Dataset.
+    """
+    # Check if file is preprocessed before processing
+    check_file_is_preprocessed(tif_path, require_preprocessing=True)
+    dataset = object.__new__(SARTileDataset)  # empty shell
+    dataset.win_size, dataset.stride = win_size, stride
+    dataset.nodata_threshold = nodata_threshold
+
+    # call the existing code path – returns Booleans etc. as usual
+    dataset._initialize_raster_properties(Path(tif_path))
+    tile_windows = dataset._compute_initial_windows_optimized_numpy()
+    paths = [tif_path] * len(tile_windows)
+    return tile_windows, paths
 
 
 class SARTileDataset(Dataset):
     """
-    Dataset for extracting valid ocean tiles from SAR GeoTIFF images.
+    A sliding-window detection dataset over preprocessed SAR GeoTIFF(s),
+    returning a dictionary with the following keys:
+    - "image": HxWx3 numpy array of the tile.
+    - "filename": Path to the source GeoTIFF file.
+    - "bbox": Bounding box in pixel coordinates [px_min, py_min, px_max, py_max].
+    - "bbox_geo": Bounding box in geographic coordinates [lon_min, lat_min, lon_max, lat_max].
+    - "crs": Coordinate Reference System as a string.
+    - "transform": Affine transform for the window.
 
-    Supports:
-      1. Preprocessing raw GeoTIFFs: Optionally apply the land mask once and save files with land pixels set to nodata.
-         Use the `preprocessed_dir` argument to indicate where to save (or read from) these files.
-      2. Persistent file handle caching: Opens files once per worker and reuses the handle across __getitem__ calls.
+    NOTE: This version assumes that all GeoTIFFs in `dataset_config["geotiff_dir"]`
+    have already been preprocessed (e.g., land masked, scaled) externally.
 
+    Image File Handling:
+    -----------------------------------
+    The dataset can be initialized in a few ways depending on how image paths
+    are specified and where the image files are located:
+
+    1. `dataset_config['geotiff_dir']` is a directory path (e.g., "/path/to/images/"):
+       - The dataset will look for image (.tif and .tiff) files within this specified directory.
+
+    2. `dataset_config['geotiff_dir']` is a path to a single image file (e.g., "/path/to/images/image1.tif"):
+       - The dataset will process only this single image file.
+
+    Attributes:
+        win_size (int): Size of the sliding window (tile height and width).
+        stride (int): Stride of the sliding window.
+        transform (Optional[Compose]): Torchvision transforms to apply to each tile.
+        img_size (int): Target image size after potential resizing (used for mosaic border,
+                        though mosaic is currently disabled).
+        _windows (List[windows.Window]): List of rasterio window objects for valid tiles.
+        _window_paths (List[str]): List of source GeoTIFF paths for each window.
+        img_files (List[str]): Generated unique names for each tile/window.
+        n (int): Total number of valid tiles.
+        indices (List[int]): List of indices for data shuffling/access.
     """
 
     def __init__(self, dataset_config: Dict, transform: Optional[Callable] = None):
@@ -35,290 +106,346 @@ class SARTileDataset(Dataset):
                 - land_threshold: Maximum fraction of land pixels allowed.
                 - nodata_threshold: Maximum fraction of no-data pixels allowed.
                 - var_threshold: Minimum variance required for valid tiles.
-                - preprocessed_dir: Optional directory for preprocessed (land-masked) GeoTIFFs.
-                - force_preprocess: If True, reprocess raw files even if preprocessed files exist.
             transform: PyTorch transforms to apply to tiles (composed outside).
         """
-        # Unpack config dictionary
         self.geotiff_dir = dataset_config["geotiff_dir"]
-        self.land_shapefile = dataset_config["land_shapefile"]
-        self.window_size = dataset_config.get("window_size", 448)
-        self.stride = int(dataset_config.get("stride_factor", 0.5) * self.window_size)
-        self.land_threshold = dataset_config.get("land_threshold", 0.8)
-        self.nodata_threshold = dataset_config.get("nodata_threshold", 0.9)
-        self.var_threshold = dataset_config.get("var_threshold", 1e-5)
-        self.preprocessed_dir = dataset_config.get("preprocessed_dir")
-        force_preprocess = dataset_config.get("force_preprocess", False)
-
-        # Dictionary to cache persistent file handles (each worker gets its own instance)
-        self._file_handles = {}
-        # Cache for any per-file land mask (if needed for raw files)
-        self.land_mask_file_cache = {}
-
-        # Load land polygons once
-        print(f"Loading land polygons from {self.land_shapefile}")
-        self.land_gdf = gpd.read_file(self.land_shapefile)
-        if self.land_gdf.crs is None:
-            self.land_gdf = self.land_gdf.set_crs("EPSG:4326")
-
-        if self.preprocessed_dir is None:  # use temp dir
-            self.preprocessed_dir = tempfile.mkdtemp()
-            print(
-                f"Using temporary directory for preprocessed files: {self.preprocessed_dir}"
-            )
-
-        # If preprocessed_dir is provided, ensure it exists and process files if needed
-        if self.preprocessed_dir is not None:
-            os.makedirs(self.preprocessed_dir, exist_ok=True)
-            raw_files = sorted(glob.glob(os.path.join(self.geotiff_dir, "*.tif")))
-            jp2_files = sorted(glob.glob(os.path.join(self.geotiff_dir, "*.jp2")))
-            raw_files = raw_files + jp2_files
-            self.files = []
-
-            # Create preprocessing tasks
-            preprocess_tasks = []
-            for raw_file in raw_files:
-                base = os.path.basename(raw_file)
-                pre_file = os.path.join(self.preprocessed_dir, base)
-                if not os.path.exists(pre_file) or force_preprocess:
-                    preprocess_tasks.append((raw_file, pre_file, base))
-                else:
-                    print(f"Using preprocessed file: {base}")
-                self.files.append(pre_file)
-
-            # Process files in parallel if any need preprocessing
-            if preprocess_tasks:
-                cpus = os.cpu_count()
-                workers = max(1, min((cpus - 1 if cpus else 1), len(preprocess_tasks)))
-                print(
-                    f"Preprocessing {len(preprocess_tasks)} files using {workers} workers"
-                )
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as exc:
-                    # Submit all preprocessing jobs
-                    futures = {}
-                    for raw_file, pre_file, basename in preprocess_tasks:
-                        future = exc.submit(
-                            self._apply_land_mask_and_scaling, raw_file, pre_file
-                        )
-                        futures[future] = basename
-
-                    # Process results as they complete
-                    for future in concurrent.futures.as_completed(futures):
-                        base = futures[future]
-                        try:
-                            future.result()
-                            print(f"Finished preprocessing: {base}")
-                        except Exception as e:
-                            print(f"Error preprocessing {base}: {str(e)}")
-        else:
-            self.files = sorted(glob.glob(os.path.join(self.geotiff_dir, "*.tif")))
-            if not self.files:
-                raise ValueError(f"No GeoTIFF files found in {self.geotiff_dir}")
-
-        print(
-            f"Found {len(self.files)} GeoTIFF files (preprocessed: {self.preprocessed_dir is not None})"
-        )
-        print("Building tile index...")
-        self.tile_index = self._build_tile_index_in_parallel()
+        self.preprocessed_dir = (
+            self.geotiff_dir
+        )  # keep this attribute for compatibility
+        self.win_size = dataset_config.get("window_size", 448)
+        self.stride = int(dataset_config.get("stride_factor", 0.5) * self.win_size)
         self.transform = transform
+        self.img_size = dataset_config.get("img_size", self.win_size)
+        self.nodata_threshold = dataset_config.get("nodata_threshold", 0.75)
 
-    def _apply_land_mask_and_scaling(self, raw_file: str, pre_file: str):
-        """
-        Preprocess a raw GeoTIFF file by applying the land mask (setting land pixels to nodata)
-        and save the resulting file to pre_file.
-        """
-        with rasterio.open(raw_file) as src:
-            if src.driver == "JP2OpenJPEG" or raw_file.endswith(".jp2"):
-                # copy over jp2 and any metadata xmls to pre_file since these already have the land mask applied``
-                shutil.copy(raw_file, pre_file)
-                xml_file = f"{raw_file}.aux.xml"
-                if os.path.exists(xml_file):
-                    shutil.copy(xml_file, f"{pre_file}.aux.xml")
-                return
-            file_crs = src.crs
-            file_transform = src.transform
-            file_height = src.height
-            file_width = src.width
-            nodata_value = src.nodata if src.nodata is not None else -9999
+        # --- these start as Python lists, converted to NumPy at the end ----
+        self._windows = []
+        self.shapes: List = []
+        self._window_paths: List[str] = []
 
-            # Reproject land polygons to the file's CRS
-            land_gdf_file_crs = self.land_gdf.to_crs(file_crs)
+        image_input_path = self.geotiff_dir
+        if image_input_path is None:
+            raise ValueError("No images found")
 
-            # Rasterize the land polygons
-            shapes = ((geom, 1) for geom in land_gdf_file_crs.geometry)
-            land_mask = features.rasterize(
-                shapes=shapes,
-                out_shape=(file_height, file_width),
-                fill=0,
-                transform=file_transform,
-                all_touched=True,
-                dtype=np.uint8,
+        p = Path(image_input_path)
+        if not p.exists():
+            raise FileNotFoundError(
+                f"Provided image_input_path does not exist: {image_input_path}"
             )
+        if p.is_dir():
+            tif_paths = sorted(glob.glob(str(p / "*.tif"))) + sorted(
+                glob.glob(str(p / "*.tiff"))
+            )
+            # Decide how many workers you can afford
+            max_workers = min(os.cpu_count() or 1, 48)  # ~250 GB / 8 GB ≈ 31
+            # Submit jobs
+            with ProcessPoolExecutor(max_workers=max_workers) as pool:
+                futures = [
+                    pool.submit(
+                        _process_single_image_wrapper,
+                        tif_path,
+                        self.win_size,
+                        self.stride,
+                        self.nodata_threshold,
+                    )
+                    for tif_path in tif_paths
+                ]
 
-            # Read the entire data and set land pixels to nodata
-            data = src.read(1).astype(np.float32)
-            data[land_mask == 1] = nodata_value
+                for f in tqdm(
+                    as_completed(futures),
+                    total=len(futures),
+                    desc="Processing images (parallel)",
+                ):
+                    wins, paths = f.result()
+                    if wins:
+                        self._windows.extend(wins)
+                        self._window_paths.extend(paths)
+        else:  # Single file mode
+            check_file_is_preprocessed(str(p), require_preprocessing=True)
+            self._process_single_image(p)
 
-            # Update metadata to reflect nodata value
-            meta = src.meta.copy()
-            meta.update({"nodata": nodata_value, "dtype": "float32"})
+        if not self._windows:
+            raise ValueError("No valid windows were generated.")
 
-            with rasterio.open(pre_file, "w", **meta) as dst:
-                dst.write(data, 1)
-
-    def _build_tile_index_in_parallel(self):
-        """
-        Build an index of valid tiles across all files using multiprocessing.
-        If files are preprocessed, land masking is already done so __getitem__ can be simplified.
-        """
-        all_tile_indices = []
-        num_cpus = os.cpu_count()
-        max_workers = max(1, min((num_cpus - 1 if num_cpus else 1), len(self.files)))
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=max_workers
-        ) as executor:
-            futures = [
-                executor.submit(self._find_valid_tile_indices_from_file, file_path, idx)
-                for idx, file_path in enumerate(self.files)
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                file_indices, _, _ = future.result()
-                if file_indices:
-                    all_tile_indices.extend(file_indices)
-        print(
-            f"Total: {len(all_tile_indices)} valid tiles across {len(self.files)} files"
+        # windows → (N,4) int32  [col_off,row_off,w,h]
+        self._windows = np.asarray(
+            [[w.col_off, w.row_off, w.width, w.height] for w in self._windows],
+            dtype=np.int32,
         )
-        return all_tile_indices
 
-    def _find_valid_tile_indices_from_file(self, file_path, file_idx):
+        # window paths → fixed-width unicode array
+        max_len = max(len(p) for p in self._window_paths)
+        self._window_paths = np.asarray(self._window_paths, dtype=f"U{max_len}")
+        # img_files → unicode array
+        self.img_files = np.asarray(
+            [f"{Path(fp).stem}_win{i}" for i, fp in enumerate(self._window_paths)],
+            dtype=f"U{max_len+8}",
+        )
+        self.n = self._windows.shape[0]
+        self.indices = np.arange(self.n, dtype=np.int32)
+
+        # per‐worker cache {worker_id: {path: (DatasetReader, nodata_val)}}
+        self._srcs: Dict[int, Dict[str, Tuple[rasterio.DatasetReader, float]]] = {}
+
+        print(
+            f"""
+        Dataset Summary:
+        - Total .tif files processed: {len(set(self._window_paths))}
+        - Total valid windows: {self.n}
+        - Window size: {self.win_size}x{self.win_size}
+        - Stride: {self.stride}
         """
-        Process a single file to build tile indices.
-        When using preprocessed files, land pixels have already been masked.
-        """
-        # print(
-        #     f"Processing file {file_idx+1}/{len(self.files)}: {os.path.basename(file_path)}"
-        # )
-        file_tile_index = []
+        )
+
+    def __len__(self) -> int:
+        return self.n
+
+    def _process_single_image(self, tif_path: Path) -> bool:
+        """Process one GeoTIFF and extend class-level lists in-place. Returns True if successful."""
         try:
-            with rasterio.open(file_path) as src:
-                file_height, file_width = src.height, src.width
-                steps_x = max(1, (file_width - self.window_size) // self.stride + 1)
-                steps_y = max(1, (file_height - self.window_size) // self.stride + 1)
-                valid_tiles = 0
-                for i_step in range(steps_y):
-                    for j_step in range(steps_x):
-                        row_start = i_step * self.stride
-                        col_start = j_step * self.stride
-                        row_end = min(row_start + self.window_size, file_height)
-                        col_end = min(col_start + self.window_size, file_width)
-                        if (row_end - row_start) < self.window_size or (
-                            col_end - col_start
-                        ) < self.window_size:
-                            continue
-                        current_window = ((row_start, row_end), (col_start, col_end))
-                        data = src.read(1, window=current_window)
-                        total_pixels = self.window_size * self.window_size
-                        if src.nodata is not None:
-                            nodata_pixels = np.sum(data == src.nodata)
-                        else:
-                            nodata_pixels = 0
-                        nodata_percentage = nodata_pixels / total_pixels
-                        if (
-                            nodata_percentage < self.nodata_threshold
-                            and np.var(data) > self.var_threshold
-                        ):
-                            file_tile_index.append(
-                                {
-                                    "file_path": file_path,
-                                    "window": current_window,
-                                }
-                            )
-                            valid_tiles += 1
-                print(
-                    f"  Found {valid_tiles} valid tiles in {os.path.basename(file_path)}"
-                )
-
-                return file_tile_index, file_path, None
+            self._initialize_raster_properties(tif_path)
+            windows = self._compute_initial_windows_optimized_numpy()
+            if windows:
+                self._windows.extend(windows)
+                self._window_paths.extend([str(tif_path)] * len(windows))
+            return True
         except Exception as e:
-            print(f"Error finding valid tile indices for {file_path}: {str(e)}")
-            return [], None, None
+            print(f"Error processing single image {tif_path}: {e}")
+            return False
+        finally:
+            if hasattr(self, "src") and self.src is not None:
+                with contextlib.suppress(Exception):
+                    self.src.close()
+                self.src = None
 
-    def _get_file_handle(self, file_path):
+    def _initialize_raster_properties(self, geotiff_path: Path):
+        self.src = rasterio.open(str(geotiff_path))
+        self.nodata_val = get_nodata_from_src(self.src)
+
+    def _compute_initial_windows(self) -> List[windows.Window]:
+        h, w = self.src.height, self.src.width
+        initial_windows_list: List[windows.Window] = []
+        if h < self.win_size or w < self.win_size:
+            return []
+
+        for y_offset in range(0, h - self.win_size + 1, self.stride):
+            for x_offset in range(0, w - self.win_size + 1, self.stride):
+                win = windows.Window(x_offset, y_offset, self.win_size, self.win_size)
+                data = self.src.read(
+                    1, window=win, boundless=True, fill_value=self.nodata_val
+                )
+                if (data == self.nodata_val).mean() < self.nodata_threshold:
+                    initial_windows_list.append(win)
+        return initial_windows_list
+
+    # @timeit
+    def _compute_initial_windows_optimized(self) -> List[windows.Window]:
         """
-        Retrieve a persistent file handle for the given file.
+        Computes initial valid windows by loading the entire raster into memory
+        and using fully vectorized operations.
+
+        WARNING: This will fail with a MemoryError on very large GeoTIFFs.
+        Use only if you are certain all your images can fit in RAM.
         """
-        if file_path not in self._file_handles:
-            self._file_handles[file_path] = rasterio.open(file_path)
-        return self._file_handles[file_path]
+        h, w = self.src.height, self.src.width
+        if h < self.win_size or w < self.win_size:
+            return []
 
-    def __len__(self):
-        return len(self.tile_index)
+        # --- 1. Load the ENTIRE image into memory ---
+        # DANGER: This is the step that can cause a MemoryError.
+        # print(f"Loading entire {w}x{h} raster into memory...")
+        full_image_data = self.src.read(1)
 
-    def expand_from_jp2(self, src, window=None):
-        comp_data_uint16 = src.read(1, window=window).astype(np.float32)
-        tags = src.tags()
+        # --- 2. Create the nodata mask for the full image ---
+        nodata_mask = (full_image_data == self.nodata_val).astype(np.float32)
+        del full_image_data  # Free up memory as soon as possible
 
-        # Retrieve min/max from tags or use fallback values
-        ocean_min = float(tags.get("min_val", 0))
-        ocean_max = float(tags.get("max_val", 1))
-        rng = ocean_max - ocean_min if ocean_max != ocean_min else 1.0
+        # --- 3. Use uniform_filter to get nodata fraction for all possible windows ---
+        # This remains the most efficient way to calculate the metric.
+        nodata_fraction_map = uniform_filter(
+            nodata_mask, size=self.win_size, mode="constant", cval=1.0
+        )
 
-        # 0 => nodata
-        comp_valid = comp_data_uint16 > 0
-        comp_data_uint16[~comp_valid] = np.nan
+        # --- 4. Generate a grid of all potential window start coordinates ---
+        # These are the top-left (y, x) coordinates for every window, respecting the stride.
+        y_starts = np.arange(0, h - self.win_size + 1, self.stride)
+        x_starts = np.arange(0, w - self.win_size + 1, self.stride)
+        yy, xx = np.meshgrid(y_starts, x_starts, indexing="ij")
 
-        comp_data = (comp_data_uint16 / 65535.0) * rng + ocean_min
-        return comp_data
+        # --- 5. Check the condition for all windows at once (fully vectorized) ---
+        # Get the nodata fraction at the bottom-right corner of each window in our grid.
+        window_end_y = yy + self.win_size - 1
+        window_end_x = xx + self.win_size - 1
 
-    def __getitem__(self, idx):
-        if idx >= len(self.tile_index):
-            raise IndexError(f"Index out of range ({idx} >= {len(self.tile_index)})")
-        tile_info = self.tile_index[idx]
-        file_path = tile_info["file_path"]
-        window = tile_info["window"]
+        # Get the fractions for all windows in our stride grid in one operation.
+        all_fractions = nodata_fraction_map[window_end_y, window_end_x]
 
-        # Use the persistent file handle
-        fh = self._get_file_handle(file_path)
-        if file_path.endswith("jp2") or fh.driver == "JP2OpenJPEG":
-            data = self.expand_from_jp2(fh, window=window)
+        # Create a boolean mask of valid windows.
+        valid_mask = all_fractions < self.nodata_threshold
+
+        # --- 6. Select the coordinates of the valid windows ---
+        valid_y_starts = yy[valid_mask]
+        valid_x_starts = xx[valid_mask]
+
+        # --- 7. Create the final list of rasterio.windows.Window objects ---
+        final_windows_list = [
+            windows.Window(int(x), int(y), self.win_size, self.win_size)
+            for y, x in zip(valid_y_starts, valid_x_starts)
+        ]
+
+        return final_windows_list
+
+    def _compute_initial_windows_optimized_numpy(self) -> List[windows.Window]:
+        """
+        Vectorized exact nodata filtering via summed‐area table (integral image).
+        Returns the same List[windows.Window] as _compute_initial_windows().
+        """
+        h, w = self.src.height, self.src.width
+        win, stride = self.win_size, self.stride
+
+        # no possible windows
+        if h < win or w < win:
+            return []
+
+        # 1. Read full band and build a binary nodata mask
+        data = self.src.read(1)
+        mask = (data == self.nodata_val).astype(np.uint32)
+
+        # 2. Build summed‐area table with a zero‐pad row/col at top+left
+        S = mask.cumsum(axis=0).cumsum(axis=1)
+        S = np.pad(S, ((1, 0), (1, 0)), mode="constant", constant_values=0)
+
+        # 3. Generate all window‐start coordinates
+        y0s = np.arange(0, h - win + 1, stride)
+        x0s = np.arange(0, w - win + 1, stride)
+        yy, xx = np.meshgrid(y0s, x0s, indexing="ij")
+
+        # 4. Compute bottom‐right corners
+        y1 = yy + win
+        x1 = xx + win
+
+        # 5. Exact nodata‐pixel counts via inclusion‐exclusion
+        #    sums = S[y0, x0] + S[y1, x1] - S[y1, x0] - S[y0, x1]
+        sums = S[yy, xx] + S[y1, x1] - S[y1, xx] - S[yy, x1]
+        # 6. Convert to fractions and threshold
+        fractions = sums.astype(np.float32) / (win * win)
+        valid = fractions < self.nodata_threshold
+
+        # 7. Build windows list
+        valid_windows = [
+            windows.Window(int(x), int(y), win, win)
+            for y, x in zip(yy[valid], xx[valid])
+        ]
+        return valid_windows
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        actual_index = self.indices[index]
+        tile_info = self._load_and_preprocess_tile(actual_index)
+        img_hwc_orig = tile_info["image"]  # H×W×3 numpy array
+
+        # Convert to tensor but let transforms handle normalization
+        # bring to [0,1] if needed; TODO: figure out what to do if we pass in raw dB values (e.g.., -20, -15, etc.)
+
+        # Apply transforms if provided (this is where normalization should happen)
+        if self.transform is not None:
+            img_tensor = self.transform(img_hwc_orig)
         else:
-            data = fh.read(1, window=window).astype(np.float32)
-        # Convert nodata values to np.nan
-        nodata_val = fh.nodata if fh.nodata is not None else -9999
-        data[data == nodata_val] = np.nan
+            img_tensor = torch.from_numpy(img_hwc_orig).float()
 
-        if self.transform:
-            tensor_data = self.transform(data)
-        else:
-            tensor_data = torch.from_numpy(data).unsqueeze(0)
+        # if img_tensor.max() > 1.0:
+        #     img_tensor /= 255.0
+        tile_info["image"] = img_tensor  # CHW tensor
+        return tile_info
 
-        # --- Metadata Extraction ---
-        window_transform = windows.transform(window, fh.transform)
-        filename = os.path.basename(file_path)
-        left, top = window_transform * (0, 0)
-        right, bottom = window_transform * (self.window_size, self.window_size)
-        bbox = torch.tensor((left, bottom, right, top))
+    def _load_and_preprocess_tile(self, idx: int) -> Dict[str, Any]:
+        col_off, row_off, w, h = self._windows[idx]
+        win = windows.Window(col_off, row_off, w, h)
+        tif_path = self._window_paths[idx]
+        tif_path_str = str(tif_path)
+
+        src, nodata = self._get_src(tif_path)
+
+        # Read the data for the specified window
+        arr = src.read(1, window=win, boundless=True, fill_value=nodata)
+        arr[arr == nodata] = 0
+        img_hwc = np.stack([arr] * 3, axis=-1)
+
+        if np.all(img_hwc == 0):
+            raise ValueError(
+                f"Processed image from {tif_path_str} is all zeros after scaling. Check nodata handling or input data."
+            )
+        bbox_pixel, bbox_geo = self._get_bounding_boxes(src, col_off, row_off, w, h)
+        window_transform = src.window_transform(win)
         window_transform = [
             getattr(window_transform, x) for x in ["a", "b", "c", "d", "e", "f"]
         ]  # Affine transform
         return {
-            "image": tensor_data,
-            "filename": filename,
-            "bbox": bbox,
-            # "bbox_latlon": bbox_latlon,
-            "crs": fh.crs.to_string(),
+            "image": img_hwc,  # H×W×3 numpy array
+            "filename": tif_path_str,
+            "bbox": bbox_pixel,  # Bounding box in pixel format
+            "bbox_geo": bbox_geo,  # Bounding box in geographic format
+            "crs": src.crs.to_string(),  # Coordinate Reference System as a string
             "transform": torch.tensor(window_transform),
         }
 
-    def close(self):
+    def _get_src(self, path: str):
+        # Manages opening files on a per-worker basis
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+
+        # Check if this worker has a cache for this file path
+        if worker_id not in self._srcs:
+            self._srcs[worker_id] = {}
+
+        if path not in self._srcs[worker_id]:
+            # This worker is opening this file for the first time
+            src = rasterio.open(path)
+            nodata = get_nodata_from_src(src)
+            self._srcs[worker_id][path] = (src, nodata)
+        return self._srcs[worker_id][path]
+
+    def _get_bounding_boxes(
+        self, src: rasterio.DatasetReader, col_off: int, row_off: int, w: int, h: int
+    ) -> Tuple[List[int], List[float]]:
+        """For a given tile, extracts bounding box information
+        in both pixel and geographic (lat/lon) coordinates.
+
+        Args:
+            src (rasterio.DatasetReader): _rasterio DatasetReader object for the source GeoTIFF.
+            col_off (int): Column offset of the tile in the source image.
+            row_off (int): Row offset of the tile in the source image.
+            w (int): Width of the tile in pixels.
+            h (int): Height of the tile in pixels.
+
+        Returns:
+            Tuple[List[float], List[float]]: Bounding box coordinates in pixel and geographic formats.
         """
-        Close all persistent file handles.
-        """
-        if hasattr(self, "_file_handles"):
-            for fh in self._file_handles.values():
-                fh.close()
-            self._file_handles = {}
+        # 1. Define pixel coordinates for the tile's bounding box relative to the full image.
+        # The top-left corner of the window is (col_off, row_off).
+        # The bottom-right corner is (col_off + width, row_off + height).
+        px_min, py_min = col_off, row_off
+        px_max, py_max = col_off + w, row_off + h
+
+        # 2. Use rasterio.transform.xy to get geographic coordinates for the corners.
+        # The `xy` method takes row, col, so the order is (py, px).
+        # We get (lon, lat) for the top-left and bottom-right corners.
+        lon_min, lat_max = src.transform * (px_min, py_min)
+        lon_max, lat_min = src.transform * (px_max, py_max)
+
+        # 3. Assemble the bounding boxes.
+        # Pixel bbox is relative to the full source image.
+        # Geographic bbox is [lon_min, lat_min, lon_max, lat_max].
+        pixel_bbox = torch.Tensor([px_min, py_min, px_max, py_max])
+        geo_bbox = torch.Tensor([lon_min, lat_min, lon_max, lat_max])
+
+        return pixel_bbox, geo_bbox
 
     def __del__(self):
-        self.close()
+        # Optional but good practice: ensure all file handles are closed when the object is destroyed.
+        if hasattr(self, "_srcs"):
+            for worker_files in self._srcs.values():
+                for src, _ in worker_files.values():
+                    try:
+                        src.close()
+                    except:
+                        pass
