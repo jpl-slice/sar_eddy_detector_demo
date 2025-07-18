@@ -13,7 +13,8 @@ from scipy.ndimage import uniform_filter
 from torch.utils.data import Dataset, get_worker_info
 from tqdm.auto import tqdm
 
-from utils.file_preprocess_checker import check_file_is_preprocessed
+from src.utils.file_preprocess_checker import check_file_is_preprocessed
+from src.utils.raster_io import read_raster_data
 
 
 def get_nodata_from_src(src: rasterio.DatasetReader) -> float:
@@ -133,8 +134,12 @@ class SARTileDataset(Dataset):
                 f"Provided image_input_path does not exist: {image_input_path}"
             )
         if p.is_dir():
-            tif_paths = sorted(glob.glob(str(p / "*.tif"))) + sorted(
-                glob.glob(str(p / "*.tiff"))
+            tif_paths = sorted(
+                [
+                    str(path)
+                    for ext in ("*.tif", "*.tiff", "*.jp2")
+                    for path in p.glob(ext)
+                ]
             )
             # Decide how many workers you can afford
             max_workers = min(os.cpu_count() or 1, 48)  # ~250 GB / 8 GB ≈ 31
@@ -308,8 +313,8 @@ class SARTileDataset(Dataset):
             return []
 
         # 1. Read full band and build a binary nodata mask
-        data = self.src.read(1)
-        mask = (data == self.nodata_val).astype(np.uint32)
+        data = read_raster_data(self.src)
+        mask = ((data == self.nodata_val) | np.isnan(data)).astype(np.uint32)
 
         # 2. Build summed‐area table with a zero‐pad row/col at top+left
         S = mask.cumsum(axis=0).cumsum(axis=1)
@@ -339,48 +344,42 @@ class SARTileDataset(Dataset):
         return valid_windows
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        actual_index = self.indices[index]
-        tile_info = self._load_and_preprocess_tile(actual_index)
-        img_hwc_orig = tile_info["image"]  # H×W×3 numpy array
+        """Returns a dictionary containing the data for a single tile."""
+        idx = self.indices[index]
 
         # Convert to tensor but let transforms handle normalization
         # bring to [0,1] if needed; TODO: figure out what to do if we pass in raw dB values (e.g.., -20, -15, etc.)
 
-        # Apply transforms if provided (this is where normalization should happen)
-        if self.transform is not None:
-            img_tensor = self.transform(img_hwc_orig)
-        else:
-            img_tensor = torch.from_numpy(img_hwc_orig).float()
-
-        # if img_tensor.max() > 1.0:
-        #     img_tensor /= 255.0
-        tile_info["image"] = img_tensor  # CHW tensor
-        return tile_info
-
-    def _load_and_preprocess_tile(self, idx: int) -> Dict[str, Any]:
         col_off, row_off, w, h = self._windows[idx]
         win = windows.Window(col_off, row_off, w, h)
         tif_path = self._window_paths[idx]
         tif_path_str = str(tif_path)
 
-        src, nodata = self._get_src(tif_path)
-
         # Read the data for the specified window
-        arr = src.read(1, window=win, boundless=True, fill_value=nodata)
-        arr[arr == nodata] = 0
+        src, nodata = self._get_src(tif_path)
+        arr = read_raster_data(src, window=win)
         img_hwc = np.stack([arr] * 3, axis=-1)
 
         if np.all(img_hwc == 0):
             raise ValueError(
                 f"Processed image from {tif_path_str} is all zeros after scaling. Check nodata handling or input data."
             )
-        bbox_pixel, bbox_geo = self._get_bounding_boxes(src, col_off, row_off, w, h)
         window_transform = src.window_transform(win)
         window_transform = [
             getattr(window_transform, x) for x in ["a", "b", "c", "d", "e", "f"]
         ]  # Affine transform
+
+        # Apply transforms if provided (this is where normalization should happen)
+        if self.transform is not None:
+            img_tensor = self.transform(arr)
+        else:
+            img_tensor = torch.from_numpy(arr).float()
+        img_tensor = torch.nan_to_num(img_tensor)  # set nan to 0
+
+        # Get bounding boxes in both pixel and geographic coordinates
+        bbox_pixel, bbox_geo = self._get_bounding_boxes(src, col_off, row_off, w, h)
         return {
-            "image": img_hwc,  # H×W×3 numpy array
+            "image": img_tensor,  # H×W×3 numpy array
             "filename": tif_path_str,
             "bbox": bbox_pixel,  # Bounding box in pixel format
             "bbox_geo": bbox_geo,  # Bounding box in geographic format
