@@ -1,0 +1,45 @@
+# config/main_config.yaml
+
+# HyP3 Credentials - leave blank for interactive prompt
+hyp3:
+  username: null
+  password: null
+
+# Workflow settings
+workflow:
+  granules:
+    - "S1A_IW_GRDH_1SDV_20190105T135245_20190105T135310_025343_02CE16_2590"
+    - "S1A_IW_GRDH_1SDV_20190105T135220_20190105T135245_025343_02CE16_D8E2"
+    - "S1A_IW_GRDH_1SDV_20190105T135335_20190105T135400_025343_02CE16_1207"
+  keep_zip: false
+
+# Output directories
+paths:
+  log_dir: "logs/"
+  download_dir: "data/downloaded/"
+  processed_dir: "data/processed/"
+  preview_dir: "data/previews/"
+  temp_dir: "data/downloaded/temp"  # we store the zip files here temporarily
+
+# HyP3 RTC Job Parameters
+job_parameters:
+  dem_name: "copernicus"
+  resolution: 30
+  radiometry: "sigma0"
+  scale: "power"
+  speckle_filter: true
+  dem_matching: false
+  include_dem: false
+  include_inc_map: false
+  include_rgb: false
+  include_scattering_area: false
+
+# Preprocessing parameters
+preprocess:
+  land_shapefile: "data/land_mask/ne_10m_land.shp"
+  clip_percentile: 99.9
+  dilate_px: 12
+  convert_to_db: true
+  save_masked: true
+  masked_dtype: "float32" # float32, uint16, or uint8
+  compress: "DEFLATE" # DEFLATE, ZSTD, LZW, etc.

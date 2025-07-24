@@ -4,13 +4,19 @@ Production script for processing Sentinel-1 SAR frames using HyP3 RTC processing
 Handles job submission, monitoring, downloading, and file extraction with credit management.
 
 # Basic usage
-python hyp3_rtc_processor.py S1A_IW_SLC__1SDV_20240101T123456_20240101T123500_012345_012345_1234
+python download_rtc_from_hyp3.py S1A_IW_SLC__1SDV_20240101T123456_20240101T123500_012345_012345_1234
 
 # Multiple granules with custom output directory
-python hyp3_rtc_processor.py granule1 granule2 -o /path/to/output --keep-zip
+python download_rtc_from_hyp3.py granule1 granule2 -o /path/to/output --keep-zip
 
 # With credentials
-python hyp3_rtc_processor.py granule1 -u username -p password
+python download_rtc_from_hyp3.py granule1 -u username -p password
+
+You can also store your credentials in a ~/.netrc file, e.g.:
+
+machine urs.earthdata.nasa.gov
+login YOUR_USERNAME
+password YOUR_PASSWORD
 """
 
 import argparse
@@ -89,7 +95,14 @@ def initialize_hyp3_client(
     username: Optional[str], password: Optional[str]
 ) -> hyp3_sdk.HyP3:
     """Initialize HyP3 client with authentication."""
-    return hyp3_sdk.HyP3(username=username, password=password, prompt=True)
+    if username and password:
+        return hyp3_sdk.HyP3(username=username, password=password)
+
+    try:
+        return hyp3_sdk.HyP3()  # Try .netrc first
+    except hyp3_sdk.exceptions.AuthenticationError:
+        logging.info(".netrc authentication failed, prompting for credentials")
+        return hyp3_sdk.HyP3(prompt="password")  # Prompt as last resort
 
 
 def display_account_statistics(client: hyp3_sdk.HyP3):
@@ -140,23 +153,22 @@ def process_granule(
 
 
 def get_or_submit_rtc_job(
-    client: hyp3_sdk.HyP3, granule: str
+    client: hyp3_sdk.HyP3, granule: str, job_parameters: Optional[dict] = None
 ) -> Optional[hyp3_sdk.Job]:
     """Check for existing job or submit new RTC job for granule."""
-
-    job_parameters = dict(
-        dem_name="copernicus",
-        resolution=30,
-        radiometry="sigma0",
-        scale="power",
-        speckle_filter=True,
-        dem_matching=False,
-        include_dem=False,
-        include_inc_map=False,
-        include_rgb=False,
-        include_scattering_area=False,
-    )
-
+    if job_parameters is None:
+        job_parameters = dict(
+            dem_name="copernicus",
+            resolution=30,
+            radiometry="sigma0",
+            scale="power",
+            speckle_filter=True,
+            dem_matching=False,
+            include_dem=False,
+            include_inc_map=False,
+            include_rgb=False,
+            include_scattering_area=False,
+        )
     existing_job = find_existing_job(client, granule, job_parameters)
     if existing_job:
         logging.info(f"Found existing job for granule {granule}: {existing_job.job_id}")
@@ -209,22 +221,25 @@ def monitor_job_completion(
         return None
 
 
-def download_and_extract_files(job: hyp3_sdk.Job, output_dir: Path, keep_zip: bool):
+def download_and_extract_files(
+    job: hyp3_sdk.Job, output_dir: Path, temp_dir: Path, keep_zip: bool
+) -> list[Path]:
     """Download job files and extract specific file types."""
-    temp_dir = output_dir / "temp"
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Get the full granule name from job parameters
     full_granule_name = get_granule_name_from_job(job)
-
     downloaded_files = job.download_files(temp_dir)
+    extracted_files = []
 
     for zip_path in downloaded_files:
         if zip_path.suffix.lower() == ".zip":
-            extract_target_files(zip_path, full_granule_name, output_dir)
+            extracted_files.extend(
+                extract_target_files(zip_path, full_granule_name, output_dir)
+            )
             if not keep_zip:
                 zip_path.unlink()
                 logging.info(f"Deleted zip file: {zip_path}")
+    return extracted_files
 
 
 def get_granule_name_from_job(job: hyp3_sdk.Job) -> str:
@@ -234,12 +249,16 @@ def get_granule_name_from_job(job: hyp3_sdk.Job) -> str:
     return "unknown_granule"
 
 
-def extract_target_files(zip_path: Path, full_granule_name: str, output_dir: Path):
+def extract_target_files(
+    zip_path: Path, full_granule_name: str, output_dir: Path
+) -> list[Path]:
     """Extract VV polarization TIF and non-RGB PNG files from zip with renamed filenames."""
-    tif_dir = output_dir / "tif"
+    tif_dir = output_dir
     png_dir = output_dir / "png"
     tif_dir.mkdir(parents=True, exist_ok=True)
     png_dir.mkdir(parents=True, exist_ok=True)
+
+    extracted_paths = []
 
     with zipfile.ZipFile(zip_path, "r") as zip_file:
         for file_info in zip_file.infolist():
@@ -249,13 +268,14 @@ def extract_target_files(zip_path: Path, full_granule_name: str, output_dir: Pat
                 new_filename = generate_new_filename(filename, full_granule_name)
                 target_dir = tif_dir if filename.endswith(".tif") else png_dir
                 extract_path = target_dir / new_filename
-
                 with zip_file.open(file_info) as source, open(
                     extract_path, "wb"
                 ) as target:
                     target.write(source.read())
 
                 logging.info(f"Extracted: {extract_path}")
+                extracted_paths.append(extract_path)
+    return extracted_paths
 
 
 def should_extract_file(filename: str) -> bool:

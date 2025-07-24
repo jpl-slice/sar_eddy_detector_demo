@@ -1,14 +1,14 @@
 """
 Land masking, nodata handling and intensity post-processing
-for single-polarisation SAR backscatter images.
+for VV SAR backscatter images.
 
 Public API
 ──────────
 • build_land_masker(shapefile_path) -> callable
 • mask_land_and_clip(src, land_masker, clip_percentile, dilate_px) -> np.ndarray
 • dilate_land_mask(arr, n_pixels)  (exposed for reuse)
-"""
 
+"""
 from __future__ import annotations
 
 from functools import lru_cache
@@ -17,18 +17,14 @@ from typing import Callable, Tuple
 import geopandas as gpd
 import numpy as np
 import rasterio
-from rasterio import features, windows
 from rasterio.mask import mask as rio_mask
 from rasterio.warp import transform_geom
 from scipy import ndimage
 from shapely.geometry import box, mapping
 
-# ──────────────── constants ─────────────────
-NODATA_DEFAULT = 0.0
 MASK_VALUE = 0.0  # value committed to disk
 
 
-# ──────────────── public helpers ────────────
 def build_land_masker(shapefile: str) -> Callable[[rasterio.CRS, dict], list[dict]]:
     """
     Load land polygons once; return a closure that clips/reprojects
@@ -36,9 +32,9 @@ def build_land_masker(shapefile: str) -> Callable[[rasterio.CRS, dict], list[dic
 
     Returns
     -------
-    land_masker(crs, bounds_geojson) -> list[dict]  (GeoJSON shapes in target CRS)
+    A function that takes a rasterio CRS and bounds tuple,
+    and returns a list of GeoJSON-like dicts representing the land mask.
     """
-
     land_ll = gpd.read_file(shapefile)
     if land_ll.crs is None:
         land_ll = land_ll.set_crs("EPSG:4326")
@@ -47,20 +43,18 @@ def build_land_masker(shapefile: str) -> Callable[[rasterio.CRS, dict], list[dic
     def _clip_to_scene(
         crs_wkt: str, bounds_tuple: tuple[float, float, float, float]
     ) -> tuple[dict, ...]:
-        # 1) footprint as Shapely in lat-lon
         minx, miny, maxx, maxy = bounds_tuple
         footprint_ll = box(minx, miny, maxx, maxy)
         clipped = gpd.clip(
             land_ll, gpd.GeoDataFrame(geometry=[footprint_ll], crs="EPSG:4326")
         )
         if clipped.empty:
-            clipped = land_ll  # rare offshore frame → keep full coastlines
+            clipped = land_ll
         return tuple(
-            transform_geom("EPSG:4326", crs_wkt, mapping(geom))  # GeoJSON dicts
+            transform_geom("EPSG:4326", crs_wkt, mapping(geom))
             for geom in clipped.geometry
         )
 
-    # The closure we hand back performs *only* cheap dict boxing
     def _land_masker(crs: rasterio.CRS, bounds) -> list[dict]:
         return list(_clip_to_scene(crs.to_string(), bounds))
 
@@ -89,9 +83,7 @@ def mask_land_and_clip(
 
     if clip_percentile is not None:
         if isinstance(clip_percentile, tuple):
-            lo, hi = clip_percentile
-            lo = np.nanpercentile(out, lo)
-            hi = np.nanpercentile(out, hi)
+            lo, hi = np.nanpercentile(out, clip_percentile)
         elif isinstance(clip_percentile, (int, float)):
             lo = np.nanpercentile(out, 0)
             hi = np.nanpercentile(out, clip_percentile)
@@ -114,7 +106,6 @@ def dilate_land_mask(arr: np.ndarray, n_pixels: int = 2) -> np.ndarray:
     return out
 
 
-# ──────────────── private helpers ───────────
 def _native_bounds_as_ll(
     src: rasterio.DatasetReader,
 ) -> tuple[float, float, float, float]:
@@ -123,10 +114,9 @@ def _native_bounds_as_ll(
 
 
 def _get_nodata(src: rasterio.DatasetReader) -> float:
-    """Robust nodata detection with tiny warm-up cost."""
+    """Robust nodata detection"""
     if src.nodata is not None:
         return float(src.nodata)
-
     # Heuristic sample (≤128×128) from UL corner
     data = src.read(1)
     # return -9999.0 if np.any(sample < -9000) else NODATA_DEFAULT
@@ -136,28 +126,3 @@ def _get_nodata(src: rasterio.DatasetReader) -> float:
         return np.nan
     else:
         return 0.0  # default nodata value
-
-
-# ────────── scaling helper (exposed for re-use) ─────────
-def scale_valid_masked_data(
-    masked: np.ndarray,
-    dtype: str,
-    valid: np.ndarray,
-    *,
-    percentile: tuple[float, float] = (0, 99),
-) -> np.ndarray:
-    """Stretch valid pixels to full uint8/uint16 range; nodata stays 0."""
-    if not np.any(valid):
-        return np.zeros_like(masked, dtype=dtype)
-
-    lo, hi = np.nanpercentile(masked[valid], percentile)
-    if lo == hi:  # flat frame
-        out = np.zeros_like(masked, dtype=dtype)
-        out[valid] = 1
-        return out
-
-    scale = 255 if dtype == "uint8" else 65535
-    usable = scale - 1
-    out = np.zeros_like(masked, dtype=dtype)
-    out[valid] = np.round(((masked[valid] - lo) / (hi - lo)) * usable + 1).astype(dtype)
-    return out
