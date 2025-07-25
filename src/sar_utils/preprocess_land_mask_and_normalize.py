@@ -14,10 +14,51 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
+import rasterio as rio
 from rasterio.enums import Resampling
 from rasterio.warp import transform_bounds
 
-from .sar_transforms import MASK_VALUE
+from .transforms import MASK_VALUE, build_land_masker, mask_land_and_clip
+
+
+def preprocess_frame(
+    raw_tif: Path,
+    out_tif: Path,
+    preview_png: Path,
+    land_masker,
+    config,
+):
+    """Mask land, optional dB conversion, save masked TIFF and preview. Config can be dict or namespace."""
+
+    # make sure all parent folders exist
+    out_tif.parent.mkdir(exist_ok=True, parents=True)
+    preview_png.parent.mkdir(exist_ok=True, parents=True)
+
+    def _get(name):
+        if isinstance(config, dict):
+            return config[name]
+        else:
+            return getattr(config, name)
+
+    clip = _get("clip_percentile")
+    dilate = _get("dilate_px")
+    db = _get("convert_to_db")
+    save = _get("save_masked")
+    dtype = _get("masked_dtype")
+    compress = _get("compress")
+    with rio.open(raw_tif) as src:
+        masked = mask_land_and_clip(
+            src, land_masker, clip_percentile=clip, dilate_px=dilate
+        )
+        if db:
+            eps = 1e-10
+            valid = np.isfinite(masked)
+            masked[valid] = 10 * np.log10(masked[valid] + eps)
+            masked = np.clip(masked, -35, None)
+        if save:
+            write_masked(src, masked, out_tif, dtype, compress=compress)
+        quicklook(src, masked, preview_png)
+    return out_tif, preview_png
 
 
 def extract_scene_id(filename: str) -> str:
@@ -164,3 +205,32 @@ def quicklook(
     fig.colorbar(im, ax=ax, label="SAR intensity", fraction=0.046, pad=0.04)
     fig.savefig(out_png, bbox_inches="tight", dpi=300)
     plt.close(fig)
+
+
+if __name__ == "__main__":
+    # simple CLI for standalone usage
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("raw_tif", type=Path)
+    parser.add_argument("out_tif", type=Path)
+    parser.add_argument("preview_png", type=Path)
+    parser.add_argument("land_shapefile", type=Path)
+    parser.add_argument("--clip", type=float, default=99.9)
+    parser.add_argument("--dilate", type=int, default=12)
+    parser.add_argument("--db", action="store_true")
+    parser.add_argument("--no-save", dest="save_masked", action="store_false")
+    parser.add_argument("--dtype", default="float32")
+    parser.add_argument("--compress", default="DEFLATE")
+    args = parser.parse_args()
+    lm = build_land_masker(args.land_shapefile)
+    # build a params dict matching expected keys
+    params = {
+        "clip_percentile": args.clip,
+        "dilate_px": args.dilate,
+        "convert_to_db": args.db,
+        "save_masked": args.save_masked,
+        "masked_dtype": args.dtype,
+        "compress": args.compress,
+    }
+    preprocess_frame(args.raw_tif, args.out_tif, args.preview_png, lm, params)

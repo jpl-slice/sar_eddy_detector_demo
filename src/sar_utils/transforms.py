@@ -9,6 +9,7 @@ Public API
 • dilate_land_mask(arr, n_pixels)  (exposed for reuse)
 
 """
+
 from __future__ import annotations
 
 from functools import lru_cache

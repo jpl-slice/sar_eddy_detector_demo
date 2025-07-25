@@ -43,3 +43,4 @@ preprocess:
   save_masked: true
   masked_dtype: "float32" # float32, uint16, or uint8
   compress: "DEFLATE" # DEFLATE, ZSTD, LZW, etc.
+  processed_suffix: ""  # suffix to append to processed filenames (e.g. "_processed")

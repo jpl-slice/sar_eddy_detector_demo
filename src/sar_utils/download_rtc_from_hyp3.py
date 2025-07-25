@@ -37,10 +37,10 @@ def main():
     hyp3_client = initialize_hyp3_client(args.username, args.password)
     display_account_statistics(hyp3_client)
 
+    temp_dir = getattr(args, "temp_dir", args.output_dir / "temp")
+
     for granule in args.granules:
-        process_granule(
-            hyp3_client, granule, args.output_dir, args.log_dir, args.keep_zip
-        )
+        fetch_tif_from_hyp3(hyp3_client, granule, args.output_dir, temp_dir, args.keep_zip)
 
 
 def parse_arguments():
@@ -129,27 +129,44 @@ def display_account_statistics(client: hyp3_sdk.HyP3):
         logging.warning(f"Could not retrieve account statistics: {e}")
 
 
-def process_granule(
-    client: hyp3_sdk.HyP3, granule: str, output_dir: Path, log_dir: Path, keep_zip: bool
-):
+def fetch_tif_from_hyp3(
+    client: hyp3_sdk.HyP3,
+    granule: str,
+    output_dir: Path,
+    temp_dir: Path,
+    keep_zip: bool,
+    job_parameters: Optional[dict] = None,
+) -> Optional[Path]:
     """Process a single granule through the complete RTC workflow."""
     logging.info(f"Processing granule: {granule}")
-
     try:
-        job = get_or_submit_rtc_job(client, granule)
+        job = get_or_submit_rtc_job(client, granule, job_parameters)
         if not job:
-            return
+            return None
 
         completed_job = monitor_job_completion(client, job)
         if not completed_job or not completed_job.succeeded():
-            log_job_failure(granule, "Job failed to complete successfully")
-            return
+            logging.error(f"Job for {granule} failed or was not completed.")
+            return None
 
-        download_and_extract_files(completed_job, output_dir, keep_zip)
+        downloaded_files = download_and_extract_files(
+            completed_job, output_dir, temp_dir, keep_zip
+        )
+        if not downloaded_files:
+            logging.error(f"No files downloaded for granule {granule}.")
+            return None
+
+        tif_files = [f for f in downloaded_files if f.suffix.lower() == ".tif"]
+        if not tif_files:
+            logging.error(f"No .tif file found for granule {granule}.")
+            return None
+
         logging.info(f"Successfully processed granule: {granule}")
+        return tif_files[0]
 
     except Exception as e:
         log_job_failure(granule, str(e))
+        return None
 
 
 def get_or_submit_rtc_job(
