@@ -11,12 +11,13 @@ import argparse
 import re
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
 import rasterio as rio
 from rasterio.enums import Resampling
-from rasterio.warp import transform_bounds
+
+from src.sar_utils.plotting import _create_georeferenced_plot
+from src.utils.raster_io import read_raster_data
 
 from .transforms import MASK_VALUE, build_land_masker, mask_land_and_clip
 
@@ -60,7 +61,17 @@ def preprocess_frame(
             masked = np.clip(masked, -35, None)
         if save:
             write_masked(src, masked, out_tif, dtype, compress=compress)
-        quicklook(src, masked, preview_png)
+            # if we saved the masked tif, we can directly use it for the PNG preview
+            with rio.open(out_tif) as masked_src:
+                quicklook(masked_src, preview_png)
+        else:
+            # if we don't save the masked tif, we "save" it to a memory file
+            # before reading/resampling it for the preview
+            mem_profile = src.profile.copy() | {"driver": "MEM", "nodata": MASK_VALUE}
+            with rio.io.MemoryFile() as memfile:
+                with memfile.open(**mem_profile) as mem:
+                    mem.write(masked, 1)
+                    quicklook(mem, preview_png)
     return out_tif, preview_png
 
 
@@ -154,62 +165,13 @@ def scale_valid_masked_data(
     return scaled
 
 
-def quicklook(
-    src: rasterio.DatasetReader,
-    masked: np.ndarray,
-    out_png: Path,
-    rows: int = 2048,
-):
+def quicklook(src: rasterio.DatasetReader, out_png: Path, rows: int = 2048):
     """Saves a lat-lon referenced grayscale preview PNG."""
-    scale = rows / src.height
-    cols = max(1, int(src.width * scale))
-
-    # resample masked array using rasterio.io
-    mem_profile = src.profile | {"driver": "MEM", "nodata": MASK_VALUE}
-    from rasterio.io import MemoryFile
-
-    with MemoryFile() as memfile:
-        with memfile.open(**mem_profile) as mem:
-            mem.write(masked, 1)
-            arr = mem.read(1, out_shape=(rows, cols), resampling=Resampling.nearest)
-
-    # 2) Now, figure out the lon/lat bounds for plotting
-    #    Rasterio’s `src.bounds` is in src.crs. If src.crs is not geographic,
-    #    we reproject those bounds into EPSG:4326.
-    try:
-        crs = src.crs
-    except AttributeError:
-        crs = None
-
-    if crs is None:
-        b = src.bounds
-        left, bottom, right, top = (b.left, b.bottom, b.right, b.top)
-    else:
-        left, bottom, right, top = transform_bounds(crs, "EPSG:4326", *src.bounds)
-
-    # Now (left,bottom,right,top) are in lon/lat
-    # 3) Build our lon & lat arrays (in degrees) exactly as before, but now
-    #    they represent true longitudes and latitudes.
-    lon = np.linspace(left, right, cols)
-    lat = np.linspace(top, bottom, rows)
-
-    # create matplotlib image with lat-lon coordinates
-    fig, ax = plt.subplots(figsize=(cols / 200, rows / 200), dpi=300)
-    # lat = np.linspace(src.bounds.top, src.bounds.bottom, rows)  # top to bottom
-    # lon = np.linspace(src.bounds.left, src.bounds.right, cols)  # left to right
-    im = ax.imshow(
-        np.nan_to_num(arr),
-        extent=(lon[0], lon[-1], lat[0], lat[-1]),
-        cmap="gray",
-        vmin=np.nanmin(arr),
-        vmax=np.nanmax(arr),
+    cols = max(1, int(src.width * rows / src.height))
+    arr = read_raster_data(src, out_shape=(rows, cols), resampling=Resampling.bilinear)
+    _create_georeferenced_plot(
+        arr, src, title=Path(src.name).name, out_png=out_png, add_colorbar=True
     )
-    ax.set_aspect("equal")
-    ax.set(title=Path(src.name).name, xlabel="Longitude", ylabel="Latitude")
-    plt.tight_layout()
-    fig.colorbar(im, ax=ax, label="SAR intensity", fraction=0.046, pad=0.04)
-    fig.savefig(out_png, bbox_inches="tight", dpi=300)
-    plt.close(fig)
 
 
 if __name__ == "__main__":

@@ -3,16 +3,14 @@ import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import rasterio
 from rasterio.enums import Resampling
-from rasterio.plot import show
 from rasterio.windows import Window, transform
 
-from src.dataset import get_nodata_from_src
+from src.sar_utils.plotting import _create_georeferenced_plot
 from src.transforms import ClipNormalizeCastToUint8
 from src.utils.bbox import parse_bbox
 from src.utils.raster_io import read_raster_data
@@ -345,38 +343,15 @@ class EddyVisualizer:
             new_width = int(src.width * scale_factor)
             new_height = int(src.height * scale_factor)
             resampling_method = Resampling.bilinear
-
             data = read_raster_data(
-                src,
-                out_shape=(new_height, new_width),
-                resampling=resampling_method,
+                src, out_shape=(new_height, new_width), resampling=resampling_method
             )
 
-            new_transform = src.transform * src.transform.scale(
-                src.width / float(new_width), src.height / float(new_height)
+            _create_georeferenced_plot(
+                raster_array=data.squeeze(),
+                src=src,
+                title=f"Preview with Merged Bounding Boxes (conf ≥ {confidence_threshold})",
+                out_png=Path(out_png),
+                bounding_boxes=bounding_boxes,
+                add_colorbar=False,
             )
-            fig, ax = plt.subplots(figsize=(10, 8))
-            show(
-                data.squeeze(),
-                transform=new_transform,
-                ax=ax,
-                cmap="gray",
-                vmin=0,
-                vmax=float(np.nanpercentile(data, 98)),
-            )
-            for xmin, ymin, xmax, ymax in bounding_boxes:
-                rect = patches.Rectangle(
-                    (xmin, ymin),
-                    xmax - xmin,
-                    ymax - ymin,
-                    linewidth=2,
-                    edgecolor="red",
-                    facecolor="none",
-                    alpha=0.7,
-                )
-                ax.add_patch(rect)
-            plt.title(
-                f"Preview with Merged Bounding Boxes (conf ≥ {confidence_threshold})"
-            )
-            plt.savefig(out_png, dpi=300, bbox_inches="tight")
-            plt.close()

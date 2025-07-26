@@ -3,13 +3,12 @@ This module provides utility functions for reading raster data, abstracting away
 the specifics of different file formats like GeoTIFF and JPEG2000.
 """
 
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Union
 
 import numpy as np
 import rasterio
-from rasterio.enums import Resampling
-from rasterio.windows import Window
 
+from src.dataset import get_nodata_from_src
 from src.utils.compress_sar_with_jpeg2000 import expand_from_jp2
 
 
@@ -23,5 +22,12 @@ def read_raster_data(
     src = rasterio.open(src_or_file) if isinstance(src_or_file, str) else src_or_file
     is_jp2 = src.driver == "JP2OpenJPEG" or src.name.lower().endswith(".jp2")
     if is_jp2:
-        return expand_from_jp2(src.name, **kwargs).squeeze()
-    return src.read(1, **kwargs).squeeze()
+        data = expand_from_jp2(src.name, **kwargs).squeeze()
+    else:
+        data = src.read(1, **kwargs)
+
+    nodata_value = get_nodata_from_src(src)
+    if nodata_value is not None:
+        data[data == nodata_value] = np.nan
+
+    return data.squeeze()
