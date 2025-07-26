@@ -3,23 +3,9 @@
 Production script for processing Sentinel-1 SAR frames using HyP3 RTC processing.
 Handles job submission, monitoring, downloading, and file extraction with credit management.
 
-# Basic usage
-python download_rtc_from_hyp3.py S1A_IW_SLC__1SDV_20240101T123456_20240101T123500_012345_012345_1234
-
-# Multiple granules with custom output directory
-python download_rtc_from_hyp3.py granule1 granule2 -o /path/to/output --keep-zip
-
-# With credentials
-python download_rtc_from_hyp3.py granule1 -u username -p password
-
-You can also store your credentials in a ~/.netrc file, e.g.:
-
-machine urs.earthdata.nasa.gov
-login YOUR_USERNAME
-password YOUR_PASSWORD
+This module is designed to work with Hydra configuration management.
 """
 
-import argparse
 import logging
 import zipfile
 from datetime import datetime
@@ -27,68 +13,6 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import hyp3_sdk
-
-
-def main():
-    """Main entry point for RTC processing workflow."""
-    args = parse_arguments()
-    setup_logging(args.log_dir)
-
-    hyp3_client = initialize_hyp3_client(args.username, args.password)
-    display_account_statistics(hyp3_client)
-
-    temp_dir = getattr(args, "temp_dir", args.output_dir / "temp")
-
-    for granule in args.granules:
-        fetch_tif_from_hyp3(hyp3_client, granule, args.output_dir, temp_dir, args.keep_zip)
-
-
-def parse_arguments():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Process Sentinel-1 SAR frames with HyP3 RTC"
-    )
-    parser.add_argument(
-        "granules", nargs="+", help="Sentinel-1 granule names to process"
-    )
-    parser.add_argument(
-        "-o",
-        "--output-dir",
-        type=Path,
-        default=Path("./output"),
-        help="Output directory",
-    )
-    parser.add_argument(
-        "-l", "--log-dir", type=Path, default=Path("./logs"), help="Log directory"
-    )
-    parser.add_argument(
-        "--keep-zip", action="store_true", help="Keep downloaded zip files"
-    )
-    parser.add_argument("-u", "--username", help="NASA Earthdata username")
-    parser.add_argument("-p", "--password", help="NASA Earthdata password")
-    return parser.parse_args()
-
-
-def setup_logging(log_dir: Path):
-    """Configure logging for the application."""
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.FileHandler(log_dir / "hyp3_processor.log"),
-            logging.StreamHandler(),
-        ],
-    )
-
-    error_handler = logging.FileHandler(log_dir / "failed_jobs.log")
-    error_handler.setLevel(logging.ERROR)
-    error_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
-
-    error_logger = logging.getLogger("failed_jobs")
-    error_logger.addHandler(error_handler)
-    error_logger.setLevel(logging.ERROR)
 
 
 def initialize_hyp3_client(
@@ -100,7 +24,7 @@ def initialize_hyp3_client(
 
     try:
         return hyp3_sdk.HyP3()  # Try .netrc first
-    except hyp3_sdk.exceptions.AuthenticationError:
+    except Exception:
         logging.info(".netrc authentication failed, prompting for credentials")
         return hyp3_sdk.HyP3(prompt="password")  # Prompt as last resort
 
@@ -195,7 +119,8 @@ def get_or_submit_rtc_job(
     batch = client.submit_rtc_job(
         granule=granule, name=f"RTC_{granule[-8:]}", **job_parameters
     )
-    return batch[0]
+    # Handle batch or single job return
+    return batch if hasattr(batch, "job_id") else (batch[0] if batch else None)
 
 
 def find_existing_job(
@@ -204,8 +129,9 @@ def find_existing_job(
     """Find a non-failed, unexpired job for a given granule."""
     jobs = client.find_jobs(job_type="RTC_GAMMA")
     for job in jobs:
+        job_parameters = getattr(job, "job_parameters", {}) or {}
         if (
-            job.job_parameters.get("granules") == [granule]
+            job_parameters.get("granules") == [granule]
             and not job.failed()
             and not job.expired()
             and job_parameters_match(job, job_params)
@@ -232,8 +158,9 @@ def monitor_job_completion(
 
     logging.info(f"Waiting for job {job.job_id} to complete...")
     try:
-        return client.watch(job, timeout=3600, interval=60)
-    except hyp3_sdk.exceptions.HyP3Error as e:
+        result = client.watch(job, timeout=3600, interval=60)
+        return job  # Return the original job since watch updates it
+    except Exception as e:
         logging.error(f"Job monitoring timeout: {e}")
         return None
 
@@ -243,8 +170,14 @@ def download_and_extract_files(
 ) -> list[Path]:
     """Download job files and extract specific file types."""
     temp_dir.mkdir(parents=True, exist_ok=True)
-
     full_granule_name = get_granule_name_from_job(job)
+
+    # if target TIFF already present, skip download/extract
+    expected_tif = output_dir / f"{full_granule_name}.tif"
+    if expected_tif.exists():
+        logging.info(f"TIF file already exists: {expected_tif}, skipping download.")
+        return [expected_tif]
+
     downloaded_files = job.download_files(temp_dir)
     extracted_files = []
 
@@ -326,7 +259,3 @@ def log_job_failure(granule: str, error_message: str):
     msg = f"GRANULE: {granule} | ERROR: {error_message}"
     logging.getLogger("failed_jobs").error(msg)
     logging.error(f"Failed to process granule {granule}. See failed_jobs.log.")
-
-
-if __name__ == "__main__":
-    main()

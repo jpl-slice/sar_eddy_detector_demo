@@ -13,13 +13,12 @@ workflow:
     - "S1A_IW_GRDH_1SDV_20190105T135335_20190105T135400_025343_02CE16_1207"
   keep_zip: false
 
-# Output directories
-paths:
-  log_dir: "logs/"
-  download_dir: "data/downloaded/"
-  processed_dir: "data/processed/"
-  preview_dir: "data/previews/"
-  temp_dir: "data/downloaded/temp"  # we store the zip files here temporarily
+# Global output directories
+log_dir: "logs/"
+download_dir: "data/downloaded/"
+processed_dir: "data/processed/"
+preview_dir: "data/previews/"
+temp_dir: "data/downloaded/temp"  # we store the zip files here temporarily
 
 # HyP3 RTC Job Parameters
 job_parameters:

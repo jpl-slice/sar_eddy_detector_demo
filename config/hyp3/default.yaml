@@ -1,0 +1,26 @@
+# HyP3 configuration for SAR data download and RTC processing
+
+# HyP3 Credentials - leave blank for interactive prompt
+username: null
+password: null
+
+# Workflow settings
+granules:
+  # - "S1A_IW_GRDH_1SDV_20190105T135245_20190105T135310_025343_02CE16_2590"
+  - "S1A_IW_GRDH_1SDV_20190105T135220_20190105T135245_025343_02CE16_D8E2"
+  # - "S1A_IW_GRDH_1SDV_20190105T135335_20190105T135400_025343_02CE16_1207"
+
+keep_zip: false
+
+# HyP3 RTC Job Parameters
+job_parameters:
+  dem_name: "copernicus"
+  resolution: 30
+  radiometry: "sigma0"
+  scale: "power"
+  speckle_filter: true
+  dem_matching: false
+  include_dem: false
+  include_inc_map: false
+  include_rgb: false
+  include_scattering_area: false

@@ -12,7 +12,6 @@ dataset_params:
   land_shapefile: "data/land_mask/ne_10m_land.shp"
   window_size: 700
   stride_factor: 0.25
-  land_threshold: 0.5
   nodata_threshold: 0.5
   var_threshold: 1.0e-5
 

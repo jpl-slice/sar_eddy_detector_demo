@@ -1,0 +1,22 @@
+# TIMM + XGBoost inference configuration
+
+# @package _global_
+defaults:
+  - default
+
+method: "inference_timm_xgboost"
+num_channels: 3  # Most TIMM models expect 3 channels
+
+# Class names for dynamic loading
+detector_class_name: "src.eddy_detector.timm_xgboost_detector.TimmXGBoostEddyDetector"
+
+# Paths - override defaults for TIMM XGBoost
+output_dir: "output/timm_xgboost"
+
+# Model options
+arch: "eva02_large_patch14_448.mim_in22k_ft_in22k"
+model_loader_class: "src.models.timm_loader.TimmLoader"
+pipeline_path: "model_checkpoints/eva02_large_patch14_448.mim_in22k_ft_in22k_xgboost_pipeline.pkl"
+
+# Inference options override
+identification_table_path: "${inference.output_dir}/positive_eddy_identifications.csv"

@@ -69,9 +69,6 @@ class SARTileDataset(Dataset):
     - "crs": Coordinate Reference System as a string.
     - "transform": Affine transform for the window.
 
-    NOTE: This version assumes that all GeoTIFFs in `dataset_config["geotiff_dir"]`
-    have already been preprocessed (e.g., land masked, scaled) externally.
-
     Image File Handling:
     -----------------------------------
     The dataset can be initialized in a few ways depending on how image paths
@@ -94,25 +91,23 @@ class SARTileDataset(Dataset):
         img_files (List[str]): Generated unique names for each tile/window.
         n (int): Total number of valid tiles.
         indices (List[int]): List of indices for data shuffling/access.
+
+    NOTE: This version assumes that all GeoTIFFs in `dataset_config["geotiff_dir"]`
+    have already been preprocessed (e.g., land masked, scaled) externally.
     """
 
     def __init__(self, dataset_config: Dict, transform: Optional[Callable] = None):
         """
         Args:
             dataset_config: A dictionary containing all dataset parameters.
-                - geotiff_dir: Directory containing raw GeoTIFF files.
-                - land_shapefile: Path to land polygon shapefile.
+                - geotiff_dir: Directory containing preprocessed GeoTIFF files.
                 - window_size: Size of tiles to extract (square).
                 - stride_factor: Stride as a fraction of window size.
-                - land_threshold: Maximum fraction of land pixels allowed.
                 - nodata_threshold: Maximum fraction of no-data pixels allowed.
                 - var_threshold: Minimum variance required for valid tiles.
             transform: PyTorch transforms to apply to tiles (composed outside).
         """
         self.geotiff_dir = dataset_config["geotiff_dir"]
-        self.preprocessed_dir = (
-            self.geotiff_dir
-        )  # keep this attribute for compatibility
         self.win_size = dataset_config.get("window_size", 448)
         self.stride = int(dataset_config.get("stride_factor", 0.5) * self.win_size)
         self.transform = transform

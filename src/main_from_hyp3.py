@@ -37,7 +37,7 @@ def main():
     setup_logging(cfg.paths.log_dir)
 
     hyp3_client = initialize_hyp3_client(cfg.hyp3.username, cfg.hyp3.password)
-    land_masker = build_land_masker(cfg.preprocess.land_shapefile)
+    land_masker = build_land_masker(cfg.preprocessing.land_shapefile)
 
     for granule in cfg.workflow.granules:
         run_granule_workflow(granule, hyp3_client, land_masker, cfg)
@@ -56,10 +56,12 @@ def run_granule_workflow(granule, hyp3_client, land_masker, cfg):
             return
 
         # Preprocess & preview in one call
-        suffix = cfg.preprocess.processed_suffix
-        out_tif = Path(cfg.paths.processed_dir) / f"{raw_tif.stem}{suffix}.tif"
-        preview_png = Path(cfg.paths.preview_dir) / f"{raw_tif.stem}_preview.png"
-        preprocess_frame(raw_tif, out_tif, preview_png, land_masker, cfg.preprocess)
+        suffix = cfg.preprocessing.processed_suffix
+        out_tif = Path(cfg.preprocessing.processed_dir) / f"{raw_tif.stem}{suffix}.tif"
+        preview_png = (
+            Path(cfg.preprocessing.preview_dir) / f"{raw_tif.stem}_preview.png"
+        )
+        preprocess_frame(raw_tif, out_tif, preview_png, land_masker, cfg.preprocessing)
 
         logging.info(f"Saved processed file: {out_tif} and preview: {preview_png}")
         logging.info(f"Successfully processed granule: {granule}")

@@ -2,12 +2,12 @@
 """
 Mask land + (optional) high-tail clip for each selected SAR frame.
 
-* Reads config from configs/base.yaml
-* Uses configs/selected_files.json (made by 00_select_top_files.py)
+* Reads config from Hydra configuration
 * Always writes a 1024-row PNG preview in data/visualisations/
 * Optionally writes the masked GeoTIFF (dtype = float32/uint16/uint8)
 """
 
+import argparse
 import re
 from pathlib import Path
 
@@ -35,10 +35,13 @@ def preprocess_frame(
     preview_png.parent.mkdir(exist_ok=True, parents=True)
 
     def _get(name):
-        if isinstance(config, dict):
+        """Get config value, handling both dict-like and attribute access."""
+        if hasattr(config, name):
+            return getattr(config, name)
+        elif isinstance(config, dict) and name in config:
             return config[name]
         else:
-            return getattr(config, name)
+            raise KeyError(f"Configuration key '{name}' not found")
 
     clip = _get("clip_percentile")
     dilate = _get("dilate_px")
@@ -161,9 +164,11 @@ def quicklook(
     scale = rows / src.height
     cols = max(1, int(src.width * scale))
 
-    # resample masked array instead using an in-memory rasterio dataset
+    # resample masked array using rasterio.io
     mem_profile = src.profile | {"driver": "MEM", "nodata": MASK_VALUE}
-    with rasterio.io.MemoryFile() as memfile:
+    from rasterio.io import MemoryFile
+
+    with MemoryFile() as memfile:
         with memfile.open(**mem_profile) as mem:
             mem.write(masked, 1)
             arr = mem.read(1, out_shape=(rows, cols), resampling=Resampling.nearest)

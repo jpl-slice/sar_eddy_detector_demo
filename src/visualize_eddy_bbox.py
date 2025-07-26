@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 from rasterio.enums import Resampling
+from rasterio.plot import show
 from rasterio.windows import Window, transform
 
 from src.dataset import get_nodata_from_src
@@ -37,13 +38,15 @@ class EddyVisualizer:
         output_dir = Path(self.config.output_dir) / output_subdir
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        if not self.detector.dataset or not self.detector.dataset.preprocessed_dir:
+        if not self.detector.dataset or not getattr(
+            self.detector.dataset, "geotiff_dir", None
+        ):
             print(
-                f"[{self.class_name}] Dataset or dir containing preprocessed images is required for preview generation."
+                f"[{self.class_name}] Dataset.geotiff_dir is required for preview generation."
             )
             return
 
-        source_image_folder = Path(self.detector.dataset.preprocessed_dir)
+        source_image_folder = Path(self.detector.dataset.geotiff_dir)
         processed_files_count = 0
 
         for filename_base in df["filename"].unique():
@@ -105,13 +108,15 @@ class EddyVisualizer:
         )
         main_output_dir.mkdir(parents=True, exist_ok=True)
 
-        if not self.detector.dataset or not self.detector.dataset.preprocessed_dir:
+        if not self.detector.dataset or not getattr(
+            self.detector.dataset, "geotiff_dir", None
+        ):
             print(
-                f"[{self.class_name}] Dataset or dir containing preprocessed images is required for saving individual previews."
+                f"[{self.class_name}] Dataset.geotiff_dir is required for saving individual previews."
             )
             return
 
-        source_image_folder = Path(self.detector.dataset.preprocessed_dir)
+        source_image_folder = Path(self.detector.dataset.geotiff_dir)
         grouped_files = df.groupby("filename")
         print(
             f"Creating individual previews for {len(df)} detections across {len(grouped_files)} files in {main_output_dir}"
@@ -351,9 +356,10 @@ class EddyVisualizer:
                 src.width / float(new_width), src.height / float(new_height)
             )
             fig, ax = plt.subplots(figsize=(10, 8))
-            ax.imshow(
-                data[0] if data.ndim == 3 and data.shape[0] == 1 else data,
+            show(
+                data.squeeze(),
                 transform=new_transform,
+                ax=ax,
                 cmap="gray",
                 vmin=0,
                 vmax=float(np.nanpercentile(data, 98)),
