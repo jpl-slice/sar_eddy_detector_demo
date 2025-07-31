@@ -61,7 +61,7 @@ def _create_georeferenced_plot(
                 (xmin, ymin),
                 xmax - xmin,
                 ymax - ymin,
-                linewidth=2,
+                linewidth=1,
                 edgecolor="red",
                 facecolor="none",
             )

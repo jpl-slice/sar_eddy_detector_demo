@@ -7,6 +7,7 @@ This module is designed to work with Hydra configuration management.
 """
 
 import logging
+import traceback
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -70,7 +71,9 @@ def fetch_tif_from_hyp3(
 
         completed_job = monitor_job_completion(client, job)
         if not completed_job or not completed_job.succeeded():
-            logging.error(f"Job for {granule} failed or was not completed.")
+            logging.error(
+                f"Job for {granule} failed or was not completed.\n{traceback.format_exc()}"
+            )
             return None
 
         downloaded_files = download_and_extract_files(
@@ -158,8 +161,7 @@ def monitor_job_completion(
 
     logging.info(f"Waiting for job {job.job_id} to complete...")
     try:
-        result = client.watch(job, timeout=3600, interval=60)
-        return job  # Return the original job since watch updates it
+        return client.watch(job, timeout=3600, interval=60)
     except Exception as e:
         logging.error(f"Job monitoring timeout: {e}")
         return None

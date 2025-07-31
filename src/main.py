@@ -114,6 +114,7 @@ def run_inference_workflow(cfg: DictConfig) -> None:
         output_dir = cfg.inference.output_dir
         logging.info(f"Inference complete. Results saved in: {output_dir}")
 
+        # TODO: make confidence threshold configurable via command line or YAML
         # Create overall previews
         detector.create_scene_previews_with_bbox(confidence_threshold=0.5, merged=True)
 
