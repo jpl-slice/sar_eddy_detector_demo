@@ -333,7 +333,14 @@ class BaseEddyDetector(abc.ABC):
             return
 
         try:
-            merged_results = merge_csv_bboxes(self._base_csv_path)
+            # Extract bbox merging parameters from config
+            bbox_config = getattr(self.config, "bbox_merging", {})
+            merged_results = merge_csv_bboxes(
+                self._base_csv_path,
+                nms_iou_threshold=bbox_config.get("nms_iou_threshold", 0.05),
+                merge_iou_threshold=bbox_config.get("merge_iou_threshold", 0.3),
+                post_nms_iou_threshold=bbox_config.get("post_nms_iou_threshold", 0.1),
+            )
             merged_list = []
             # Process each file's detections to create merged bounding boxes
             for filename, detections in merged_results.items():

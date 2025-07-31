@@ -30,6 +30,12 @@ nodata_value: 0
 identification_table_path: "${inference.output_dir}/positive_eddy_identifications.csv"
 positive_class_index: 1
 
+# Bounding box merging configuration
+bbox_merging:
+  nms_iou_threshold: 0.05        # IoU threshold for initial NMS
+  merge_iou_threshold: 0.3       # IoU threshold for union-based merging
+  post_nms_iou_threshold: 0.1    # IoU threshold for post-merge NMS
+
 # Prefilter configuration
 prefilter:
   enabled: false
