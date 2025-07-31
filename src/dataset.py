@@ -14,25 +14,7 @@ from torch.utils.data import Dataset, get_worker_info
 from tqdm.auto import tqdm
 
 from src.utils.file_preprocess_checker import check_file_is_preprocessed
-from src.utils.raster_io import read_raster_data
-
-
-def get_nodata_from_src(src: rasterio.DatasetReader) -> float:
-    # return self.src.nodata if self.src.nodata is not None else -9999.0
-    if src.nodata is not None:
-        return src.nodata
-    else:
-        data = src.read(
-            1,
-            window=windows.Window(0, 0, min(128, src.width), min(128, src.height)),
-            boundless=True,
-            fill_value=0,
-        )  # Read a sample
-        if np.any(data < -9000):  # Heuristic from user
-            # If nodata is not set, assume a common nodata value for SAR data
-            return -9999.0
-        else:
-            return 0.0  # Default to 0 if not otherwise determined.
+from src.utils.raster_io import get_nodata_from_src, read_raster_data
 
 
 def _process_single_image_wrapper(
