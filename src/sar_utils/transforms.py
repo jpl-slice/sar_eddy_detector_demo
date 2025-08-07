@@ -12,6 +12,7 @@ Public API
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Callable, Tuple
 
@@ -22,6 +23,8 @@ from rasterio.mask import mask as rio_mask
 from rasterio.warp import transform_geom
 from scipy import ndimage
 from shapely.geometry import box, mapping
+
+from src.utils.raster_io import read_raster_data
 
 MASK_VALUE = 0.0  # value committed to disk
 
@@ -50,11 +53,18 @@ def build_land_masker(shapefile: str) -> Callable[[rasterio.CRS, dict], list[dic
             land_ll, gpd.GeoDataFrame(geometry=[footprint_ll], crs="EPSG:4326")
         )
         if clipped.empty:
-            clipped = land_ll
-        return tuple(
-            transform_geom("EPSG:4326", crs_wkt, mapping(geom))
-            for geom in clipped.geometry
-        )
+            return tuple()
+        os.environ["OGR_ENABLE_PARTIAL_REPROJECTION"] = "TRUE"
+        try:
+            return tuple(
+                transform_geom("EPSG:4326", crs_wkt, mapping(geom))
+                for geom in clipped.geometry
+                if geom.is_valid
+            )
+        except Exception:
+            return tuple()
+        finally:
+            os.environ.pop("OGR_ENABLE_PARTIAL_REPROJECTION", None)
 
     def _land_masker(crs: rasterio.CRS, bounds) -> list[dict]:
         return list(_clip_to_scene(crs.to_string(), bounds))
@@ -73,11 +83,15 @@ def mask_land_and_clip(
 ) -> np.ndarray:
     """Main algorithm: (1) nodata→NaN (2) land mask (3) dilate (4) optional clip."""
     shapes_utm = land_masker(src.crs, _native_bounds_as_ll(src))
-    masked_arr, _ = rio_mask(
-        src, shapes_utm, invert=True, nodata=np.nan, filled=True, crop=False
-    )
-    out = masked_arr[0].astype("float32")
-    out[out == _get_nodata(src)] = np.nan  # ensure nodata is NaN
+
+    if not shapes_utm:  # ocean-only dataset
+        out = read_raster_data(src)
+    else:
+        masked_arr, _ = rio_mask(
+            src, shapes_utm, invert=True, nodata=np.nan, filled=True, crop=False
+        )
+        out = masked_arr[0].astype("float32")
+        out[out == _get_nodata(src)] = np.nan  # ensure nodata is NaN
 
     if dilate_px > 0:
         out = dilate_land_mask(out, dilate_px)
