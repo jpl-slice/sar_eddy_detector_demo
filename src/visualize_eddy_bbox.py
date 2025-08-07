@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 from rasterio.enums import Resampling
-from rasterio.windows import Window, transform
+from rasterio.windows import Window
 
 from src.sar_utils.plotting import _create_georeferenced_plot
 from src.transforms import ClipNormalizeCastToUint8
@@ -144,12 +144,7 @@ class EddyVisualizer:
                         )
                         try:
                             window = self._calculate_preview_window(
-                                src.transform,
-                                src.height,
-                                src.width,
-                                bbox,
-                                bbox_buffer_pixels,
-                                patch_size,
+                                src, bbox, bbox_buffer_pixels, patch_size
                             )
                             if window is None:
                                 continue
@@ -225,32 +220,65 @@ class EddyVisualizer:
         return df
 
     def _calculate_preview_window(
-        self, src_transform, src_height, src_width, bbox, buffer, patch_size
+        self,
+        src: rasterio.io.DatasetReader,
+        bbox: Tuple[float, float, float, float],
+        buffer: int,
+        patch_size: int,
     ) -> Optional[Window]:
+        """
+        Given a lon/lat bbox (lon_min, lat_min, lon_max, lat_max),
+        reproject it into the src CRS, compute the pixel window,
+        buffer it, clamp to the image, and ensure at least patch_size.
+        """
         try:
-            left, bottom, right, top = bbox
-            col_start, row_start = ~src_transform * (left, top)
-            col_end, row_end = ~src_transform * (right, bottom)
-            row_start, row_end = sorted(
-                [int(row_start) - buffer, int(row_end) + buffer]
-            )
-            col_start, col_end = sorted(
-                [int(col_start) - buffer, int(col_end) + buffer]
-            )
-            row_start, col_start = max(0, row_start), max(0, col_start)
-            row_end, col_end = min(src_height, row_end), min(src_width, col_end)
+            # 1. Unpack longitude/latitude bounds
+            lon_min, lat_min, lon_max, lat_max = bbox
+
+            # 2. Reproject from WGS84 → src.crs (if needed)
+            src_crs = src.crs or rasterio.crs.CRS.from_epsg(4326)
+            if src_crs.to_epsg() != 4326:
+                xs, ys = rasterio.warp.transform(
+                    rasterio.crs.CRS.from_epsg(4326),
+                    src_crs,
+                    [lon_min, lon_max],
+                    [lat_max, lat_min],
+                )
+                x0, x1 = xs
+                y0, y1 = ys
+            else:
+                x0, x1 = lon_min, lon_max
+                y0, y1 = (
+                    lat_max,
+                    lat_min,
+                )  # note: index wants (x, y) pairs as (col, row)
+
+            # 3. Convert reprojected corner coords into pixel indices
+            col0, row0 = src.index(x0, y0)  # top‐left
+            col1, row1 = src.index(x1, y1)  # bottom‐right
+
+            # 4. Add buffer & sort
+            row_start, row_end = sorted([row0 - buffer, row1 + buffer])
+            col_start, col_end = sorted([col0 - buffer, col1 + buffer])
+
+            # 5. Clamp to image bounds
+            row_start = max(0, row_start)
+            col_start = max(0, col_start)
+            row_end = min(src.height, row_end)
+            col_end = min(src.width, col_end)
+
             row_start, row_end = self._ensure_min_patch_size(
-                row_start, row_end, patch_size, src_height
+                row_start, row_end, patch_size, src.height
             )
             col_start, col_end = self._ensure_min_patch_size(
-                col_start, col_end, patch_size, src_width
+                col_start, col_end, patch_size, src.width
             )
-            window_height, window_width = row_end - row_start, col_end - col_start
-            if window_height <= 0 or window_width <= 0:
-                print(
-                    f"  Warning: Calculated invalid window dimensions ({window_width}x{window_height}) for bbox {bbox}. Skipping."
-                )
+
+            # 6. Check for valid window
+            if row_end <= row_start or col_end <= col_start:
                 return None
+
+            # 7. Return a Window built from row/col slices
             return Window.from_slices((row_start, row_end), (col_start, col_end))
         except Exception as e:
             print(f"[{self.class_name}] Error calculating preview window: {e}")
@@ -290,7 +318,7 @@ class EddyVisualizer:
     ) -> None:
         fig, ax = plt.subplots(1, figsize=(10, 10))
         try:
-            window_transform = transform(window, src_transform)
+            window_transform = rasterio.windows.transform(window, src_transform)
             left_plot, top_plot = window_transform * (0, 0)
             right_plot, bottom_plot = window_transform * (window.width, window.height)
 

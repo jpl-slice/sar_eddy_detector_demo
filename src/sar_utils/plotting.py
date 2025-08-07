@@ -51,16 +51,12 @@ def _create_georeferenced_plot(
     ax.set(title=title, xlabel="Longitude", ylabel="Latitude")
 
     if bounding_boxes:
-        # Bounding boxes must also be reprojected to be displayed correctly
-        for xmin, ymin, xmax, ymax in bounding_boxes:
-            if crs is not None:
-                xmin, ymin, xmax, ymax = transform_bounds(
-                    crs, "EPSG:4326", xmin, ymin, xmax, ymax
-                )
+        # bounding_boxes are already in (lon_min, lat_min, lon_max, lat_max)
+        for lon_min, lat_min, lon_max, lat_max in bounding_boxes:
             rect = patches.Rectangle(
-                (xmin, ymin),
-                xmax - xmin,
-                ymax - ymin,
+                (lon_min, lat_min),
+                lon_max - lon_min,
+                lat_max - lat_min,
                 linewidth=1,
                 edgecolor="red",
                 facecolor="none",

@@ -354,7 +354,7 @@ class SARTileDataset(Dataset):
         img_tensor = torch.nan_to_num(img_tensor)  # set nan to 0
 
         # Get bounding boxes in both pixel and geographic coordinates
-        bbox_pixel, bbox_geo = self._get_bounding_boxes(src, col_off, row_off, w, h)
+        bbox_pixel, bbox_geo = self._get_bounding_boxes(src, win)
         return {
             "image": img_tensor,  # H×W×3 numpy array
             "filename": tif_path_str,
@@ -381,7 +381,7 @@ class SARTileDataset(Dataset):
         return self._srcs[worker_id][path]
 
     def _get_bounding_boxes(
-        self, src: rasterio.DatasetReader, col_off: int, row_off: int, w: int, h: int
+        self, src: rasterio.DatasetReader, win: windows.Window
     ) -> Tuple[List[int], List[float]]:
         """For a given tile, extracts bounding box information
         in both pixel and geographic (lat/lon) coordinates.
@@ -396,21 +396,28 @@ class SARTileDataset(Dataset):
         Returns:
             Tuple[List[float], List[float]]: Bounding box coordinates in pixel and geographic formats.
         """
-        # 1. Define pixel coordinates for the tile's bounding box relative to the full image.
-        # The top-left corner of the window is (col_off, row_off).
-        # The bottom-right corner is (col_off + width, row_off + height).
-        px_min, py_min = col_off, row_off
-        px_max, py_max = col_off + w, row_off + h
 
-        # 2. Use rasterio.transform.xy to get geographic coordinates for the corners.
-        # The `xy` method takes row, col, so the order is (py, px).
-        # We get (lon, lat) for the top-left and bottom-right corners.
-        lon_min, lat_max = src.transform * (px_min, py_min)
-        lon_max, lat_min = src.transform * (px_max, py_max)
+        # 1. Get current window's spatial bounds in dataset's CRS (i.e., can be in degrees if CRS is geographic, or meters if CRS is projected).
+        left, bottom, right, top = src.window_bounds(win)
+
+        # 2. Reproject from the raster's CRS to WGS84 (lat/lon)
+        if src.crs != rasterio.crs.CRS.from_epsg(4326):
+            # Transform corner coordinates to lat/lon
+            xs, ys = rasterio.warp.transform(
+                src.crs, rasterio.crs.CRS.from_epsg(4326), [left, right], [bottom, top]
+            )
+            lon_min, lon_max = xs
+            lat_min, lat_max = ys
+        else:
+            # Already in lat/lon
+            lon_min, lon_max = left, right
+            lat_min, lat_max = bottom, top
 
         # 3. Assemble the bounding boxes.
         # Pixel bbox is relative to the full source image.
         # Geographic bbox is [lon_min, lat_min, lon_max, lat_max].
+        px_min, py_min = win.col_off, win.row_off
+        px_max, py_max = win.col_off + win.width, win.row_off + win.height
         pixel_bbox = torch.Tensor([px_min, py_min, px_max, py_max])
         geo_bbox = torch.Tensor([lon_min, lat_min, lon_max, lat_max])
 
