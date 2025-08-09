@@ -6,71 +6,91 @@ This document outlines the folder layout of the **SAR Eddy Detection Demo** proj
 
 ```
 config/
-├── default.yaml        # Global default settings
-└── inference.yaml      # Settings specific to running inference
+├── config.yaml                # (Optional) Base/global config entry
+├── main_config.yaml           # Primary Hydra root config (loaded by main scripts)
+├── inference.yaml             # Convenience composed config for standard inference
+├── inference_timm_xgboost.yaml# Convenience config targeting timm+xgboost pipeline
+├── hyp3/                      # Hydra config group: hyp3 job + granule selection
+│   ├── default.yaml
+│   └── granules.yaml
+├── inference/                 # Hydra config group: inference variants
+│   ├── default.yaml
+│   └── timm_xgb.yaml
+└── preprocessing/             # Hydra config group: preprocessing variants
+    └── default.yaml
 
 data/
-├── land_mask/
-│   ├── ne_10m_land.shp # Natural Earth land boundary shapefile
-│   └── ne_10m_land.shx # Spatial index for land shapefile
-└── README.md           # Instructions for data handling
+├── land_mask/                 # Land/shoreline ancillary data (Natural Earth, etc.)
+└── ...                        # Input SAR scenes & intermediate preprocessing outputs
 
 model_checkpoints/
-└── checkpoint.tar      # Pretrained model checkpoint
+└── checkpoint.tar             # Pretrained checkpoint bundle (may include encoder + aux models)
+└── eva02_large_patch14_448.mim_in22k_ft_in22k_xgboost_pipeline.pkl  # Pretrained timm+XGBoost model pipeline
 
 src/
-├── __init__.py         # Initializes the src directory as a package
-├── dataset.py          # Data handling and preprocessing routines
-├── inference.py        # Model inference pipeline logic
-├── main.py             # Main entry point for running the demo
-├── model.py            # Model loading and architecture (supports r50_1x_sk0)
-├── visualize_eddy_bbox.py  # Visualization tools for detected eddy bounding boxes
-├── models/
-│   ├── __init__.py     # Initializes the models package
-│   └── simclr_resnet.py # SimCLR ResNet implementation
-└── utils/
-    ├── __init__.py     # Initializes the utilities package
-    ├── bbox.py         # Bounding box manipulation functions
-    └── config.py       # Configuration parsing functions
+├── __init__.py
+├── dataset.py                 # Dataset construction & tile generation
+├── main.py                    # Standard entry point (Hydra-enabled)
+├── transforms.py              # Image / tensor transform definitions used by dataset/model
+├── visualize_eddy_bbox.py     # Visualization utilities for detected eddy bounding boxes
+│
+├── eddy_detector/             # Detector abstraction & concrete detector implementations
+│   ├── __init__.py
+│   ├── base_detector.py       # Abstract / shared detection logic
+│   ├── simclr_detector.py     # Detector using SimCLR feature backbone
+│   └── timm_xgboost_detector.py # Detector using timm backbone + XGBoost classifier
+│
+├── models/                    # Model & backbone loaders (feature extraction architectures)
+│   ├── __init__.py
+│   ├── simclr_loader.py       # Load SimCLR checkpoints / weights
+│   ├── simclr_resnet.py       # SimCLR ResNet backbone definition
+│   └── timm_loader.py         # timm model loader / wrapper
+│
+├── sar_utils/                 # SAR-specific preprocessing & utilities
+│   ├── __init__.py
+│   ├── download_rtc_from_hyp3.py        # HyP3 API download helper
+│   ├── plotting.py                        # Plotting helpers
+│   ├── preprocess_land_mask_and_normalize.py # Land mask + normalization pipeline
+│   └── transforms.py                     # SAR-domain specific transforms
+│
+└── utils/                     # General utility helpers
+    ├── __init__.py
+    ├── bbox.py                # Bounding box manipulation functions
+    ├── compress_sar_with_jpeg2000.py # Optional JP2 compression routines
+    ├── config.py              # Hydra config loading / composition helpers
+    ├── file_preprocess_checker.py # File readiness / preprocessing state checks
+    ├── importer.py            # Dynamic import utilities
+    └── raster_io.py           # Raster read/write utilities
 
-demos/
-├── preview_demo.ipynb  # Notebook for previewing image outputs
-└── run_demo.sh         # Shell script for running the demo pipeline
-
-output/
-└── (All output results, such as visualizations and logs, will be saved here)
+output/                        # Primary output directory (detections, previews, logs); can customize output directory via CLI
 ```
 
 ## Folder Descriptions
 
 - **config/**  
-  Contains YAML configuration files:
-  - `default.yaml`: Contains global default settings.
-  - `inference.yaml`: Contains settings specific to running inference.
+  Hydra-based configuration system. Top-level YAML files (e.g., `main_config.yaml`) are composed configs for common runs. Subdirectories (`hyp3/`, `inference/`, `preprocessing/`) are Hydra config groups; you can override parts of a run via CLI, e.g.:  
+  `python -m src.main hyp3=granules inference=timm_xgb preprocessing=default`  
+  or supply ad‑hoc overrides:  
+  `python -m src.main inference.threshold=0.9 output_dir=output/experiment_01`  
+  The system enables hierarchical, modular configuration without editing code.
 
 - **data/**  
-  Stores all input data files:
-  - The `land_mask` folder includes the Natural Earth land boundary shapefile and its spatial index.
-  - The README in this folder provides additional instructions for managing data.
+  Raw & intermediate SAR imagery plus ancillary data (land mask, etc.). Preprocessing writes normalized / tiled products into subfolders before detection runs.
 
 - **model_checkpoints/**  
-  Contains the pretrained model checkpoint (`checkpoint.tar`) used during inference.
+  Bundled pretrained model artifacts (encoders, detector heads, auxiliary components) loaded at inference time.
 
 - **src/**  
-  Holds all source code for the project:
-  - `main.py` is the primary entry point.
-  - Other scripts (`dataset.py`, `inference.py`, `model.py`, and `visualize_eddy_bbox.py`) implement core functionalities.
-  - The `models/` subfolder contains specific model implementations.
-  - The `utils/` subfolder contains helper functions for configuration parsing and bounding box operations.
+  All source code: entry (`main.py`), dataset & transform logic, detector abstractions, backbone loaders, SAR domain utilities, and general helpers.
 
-<!-- - **demos/**  
-  Provides demonstration files:
-  - A Jupyter Notebook (`preview_demo.ipynb`) to preview outputs.
-  - A shell script (`run_demo.sh`) to run the full pipeline. -->
+  - `eddy_detector/`: Implements the detector interface and concrete strategies (SimCLR, timm+XGBoost).  
+  - `models/`: Backbones & loaders for feature extraction.  
+  - `sar_utils/`: Domain-specific preprocessing (HyP3 downloads, masking, normalization).  
+  - `utils/`: Generic utilities (config integration, IO, bbox operations, compression, dynamic imports).  
 
-- **output/**  
-  Destination folder for all generated results (e.g., detection outputs, visualizations).
+- **output/** / **outputs/** / **output_test/**  
+  Generated artifacts: detection CSVs, preview imagery, logs, date-stamped batch outputs, and experimental/test runs.
 
 ## Usage
 
-For detailed instructions on setting up your environment and running the demo, please refer to the [Installation Guide](INSTALLATION.md). This document focuses on the repository layout to help you understand where each component is located.
+See the [Installation Guide](INSTALLATION.md) for environment setup and running the pipeline. This document focuses on repository layout and configuration structure.

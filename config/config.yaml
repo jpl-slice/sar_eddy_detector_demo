@@ -1,0 +1,20 @@
+defaults:
+  - hyp3: default
+  - preprocessing: default
+  - inference: default
+  - _self_
+
+# Workflow control
+mode: "full"  # "hyp3_only", "inference_only", or "full"
+
+# Common paths
+paths:
+  log_dir: "logs/"
+  download_dir: "data/downloaded/"
+  processed_dir: "data/processed/"
+  preview_dir: "data/previews/"
+  temp_dir: "data/downloaded/temp"
+  output_dir: "output/"
+
+# Debug and logging
+debug: false

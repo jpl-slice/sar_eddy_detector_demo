@@ -1,0 +1,52 @@
+# Default inference configuration for eddy detection
+
+method: "inference"
+num_channels: 1
+
+# Class names for dynamic loading
+detector_class_name: "SimCLREddyDetector"
+
+# Paths - promoted from paths block, interpolated from global config
+output_dir: ${paths.output_dir}
+geotiff_dir: ${paths.processed_dir}  # For full workflow, use processed dir as input
+
+# Dataset parameters
+dataset_params:
+  dataset_class_name: "src.dataset.SARTileDataset"
+  geotiff_dir: ${inference.geotiff_dir}
+  window_size: 700
+  stride_factor: 0.25
+  nodata_threshold: 0.7
+  var_threshold: 1.0e-5
+
+# Model options
+model_loader_class: "src.models.simclr_loader.SimCLRLoader"
+arch: "r50_1x_sk0"
+num_classes: 2
+pretrain: "model_checkpoints/checkpoint.tar"
+nodata_value: 0
+
+# Inference options
+identification_table_path: "${inference.output_dir}/positive_eddy_identifications.csv"
+positive_class_index: 1
+
+# Bounding box merging configuration
+bbox_merging:
+  nms_iou_threshold: 0.05        # IoU threshold for initial NMS
+  merge_iou_threshold: 0.3       # IoU threshold for union-based merging
+  post_nms_iou_threshold: 0.1    # IoU threshold for post-merge NMS
+
+# Prefilter configuration
+prefilter:
+  enabled: false
+  store_results: false
+  pass_classes: [2]
+  model:
+    arch: "r50_1x_sk0"
+    num_classes: 10
+    pretrain: null
+
+# Shared processing parameters
+device: "cpu"  # "cuda" or "cpu"
+workers: 2
+batch_size: 128

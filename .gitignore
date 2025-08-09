@@ -1,4 +1,7 @@
+data/
+.github
 output
+outputs
 *.png
 # Byte-compiled / optimized / DLL files
 __pycache__/

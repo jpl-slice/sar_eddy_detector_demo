@@ -14,25 +14,7 @@ from torch.utils.data import Dataset, get_worker_info
 from tqdm.auto import tqdm
 
 from src.utils.file_preprocess_checker import check_file_is_preprocessed
-from src.utils.raster_io import read_raster_data
-
-
-def get_nodata_from_src(src: rasterio.DatasetReader) -> float:
-    # return self.src.nodata if self.src.nodata is not None else -9999.0
-    if src.nodata is not None:
-        return src.nodata
-    else:
-        data = src.read(
-            1,
-            window=windows.Window(0, 0, min(128, src.width), min(128, src.height)),
-            boundless=True,
-            fill_value=0,
-        )  # Read a sample
-        if np.any(data < -9000):  # Heuristic from user
-            # If nodata is not set, assume a common nodata value for SAR data
-            return -9999.0
-        else:
-            return 0.0  # Default to 0 if not otherwise determined.
+from src.utils.raster_io import get_nodata_from_src, read_raster_data
 
 
 def _process_single_image_wrapper(
@@ -69,9 +51,6 @@ class SARTileDataset(Dataset):
     - "crs": Coordinate Reference System as a string.
     - "transform": Affine transform for the window.
 
-    NOTE: This version assumes that all GeoTIFFs in `dataset_config["geotiff_dir"]`
-    have already been preprocessed (e.g., land masked, scaled) externally.
-
     Image File Handling:
     -----------------------------------
     The dataset can be initialized in a few ways depending on how image paths
@@ -94,25 +73,23 @@ class SARTileDataset(Dataset):
         img_files (List[str]): Generated unique names for each tile/window.
         n (int): Total number of valid tiles.
         indices (List[int]): List of indices for data shuffling/access.
+
+    NOTE: This version assumes that all GeoTIFFs in `dataset_config["geotiff_dir"]`
+    have already been preprocessed (e.g., land masked, scaled) externally.
     """
 
     def __init__(self, dataset_config: Dict, transform: Optional[Callable] = None):
         """
         Args:
             dataset_config: A dictionary containing all dataset parameters.
-                - geotiff_dir: Directory containing raw GeoTIFF files.
-                - land_shapefile: Path to land polygon shapefile.
+                - geotiff_dir: Directory containing preprocessed GeoTIFF files.
                 - window_size: Size of tiles to extract (square).
                 - stride_factor: Stride as a fraction of window size.
-                - land_threshold: Maximum fraction of land pixels allowed.
                 - nodata_threshold: Maximum fraction of no-data pixels allowed.
                 - var_threshold: Minimum variance required for valid tiles.
             transform: PyTorch transforms to apply to tiles (composed outside).
         """
         self.geotiff_dir = dataset_config["geotiff_dir"]
-        self.preprocessed_dir = (
-            self.geotiff_dir
-        )  # keep this attribute for compatibility
         self.win_size = dataset_config.get("window_size", 448)
         self.stride = int(dataset_config.get("stride_factor", 0.5) * self.win_size)
         self.transform = transform
@@ -377,7 +354,7 @@ class SARTileDataset(Dataset):
         img_tensor = torch.nan_to_num(img_tensor)  # set nan to 0
 
         # Get bounding boxes in both pixel and geographic coordinates
-        bbox_pixel, bbox_geo = self._get_bounding_boxes(src, col_off, row_off, w, h)
+        bbox_pixel, bbox_geo = self._get_bounding_boxes(src, win)
         return {
             "image": img_tensor,  # H×W×3 numpy array
             "filename": tif_path_str,
@@ -404,7 +381,7 @@ class SARTileDataset(Dataset):
         return self._srcs[worker_id][path]
 
     def _get_bounding_boxes(
-        self, src: rasterio.DatasetReader, col_off: int, row_off: int, w: int, h: int
+        self, src: rasterio.DatasetReader, win: windows.Window
     ) -> Tuple[List[int], List[float]]:
         """For a given tile, extracts bounding box information
         in both pixel and geographic (lat/lon) coordinates.
@@ -419,21 +396,28 @@ class SARTileDataset(Dataset):
         Returns:
             Tuple[List[float], List[float]]: Bounding box coordinates in pixel and geographic formats.
         """
-        # 1. Define pixel coordinates for the tile's bounding box relative to the full image.
-        # The top-left corner of the window is (col_off, row_off).
-        # The bottom-right corner is (col_off + width, row_off + height).
-        px_min, py_min = col_off, row_off
-        px_max, py_max = col_off + w, row_off + h
 
-        # 2. Use rasterio.transform.xy to get geographic coordinates for the corners.
-        # The `xy` method takes row, col, so the order is (py, px).
-        # We get (lon, lat) for the top-left and bottom-right corners.
-        lon_min, lat_max = src.transform * (px_min, py_min)
-        lon_max, lat_min = src.transform * (px_max, py_max)
+        # 1. Get current window's spatial bounds in dataset's CRS (i.e., can be in degrees if CRS is geographic, or meters if CRS is projected).
+        left, bottom, right, top = src.window_bounds(win)
+
+        # 2. Reproject from the raster's CRS to WGS84 (lat/lon)
+        if src.crs != rasterio.crs.CRS.from_epsg(4326):
+            # Transform corner coordinates to lat/lon
+            xs, ys = rasterio.warp.transform(
+                src.crs, rasterio.crs.CRS.from_epsg(4326), [left, right], [bottom, top]
+            )
+            lon_min, lon_max = xs
+            lat_min, lat_max = ys
+        else:
+            # Already in lat/lon
+            lon_min, lon_max = left, right
+            lat_min, lat_max = bottom, top
 
         # 3. Assemble the bounding boxes.
         # Pixel bbox is relative to the full source image.
         # Geographic bbox is [lon_min, lat_min, lon_max, lat_max].
+        px_min, py_min = win.col_off, win.row_off
+        px_max, py_max = win.col_off + win.width, win.row_off + win.height
         pixel_bbox = torch.Tensor([px_min, py_min, px_max, py_max])
         geo_bbox = torch.Tensor([lon_min, lat_min, lon_max, lat_max])
 

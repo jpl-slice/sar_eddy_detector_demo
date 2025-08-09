@@ -1,34 +1,32 @@
-method: "inference"
+method: inference
 num_channels: 1
 ngpus_per_node: 1
 
 # Class names for dynamic loading
-detector_class_name: "SimCLREddyDetector"
+detector_class_name: SimCLREddyDetector
 
 # Dataset parameters (nested under a single key)
 dataset_params:
-  dataset_class_name: "src.dataset.SARTileDataset"
-  geotiff_dir: "data/"
-  preprocessed_dir: "data/"
-  land_shapefile: "data/land_mask/ne_10m_land.shp"
+  dataset_class_name: src.dataset.SARTileDataset
+  geotiff_dir: ${paths.processed_dir}
+  land_shapefile: data/land_mask/ne_10m_land.shp
   window_size: 700
   stride_factor: 0.25
-  land_threshold: 0.8
   nodata_threshold: 0.9
   var_threshold: 1.0e-5
 
 # Model options
 model_loader_class: src.models.simclr_loader.SimCLRLoader
-arch: "r50_1x_sk0"
+arch: r50_1x_sk0
 num_classes: 2
-pretrain: "model_checkpoints/checkpoint.tar"
+pretrain: model_checkpoints/checkpoint.tar
 
 # Inference options
 batch_size: 128
-output_dir: "output"
-identification_table_path: "output/positive_eddy_identifications.csv"
+output_dir: output
+identification_table_path: output/positive_eddy_identifications.csv
 positive_class_index: 1
-device: "cuda"
+device: cuda
 
 # Prefilter configuration (nested structure)
 prefilter:
@@ -36,9 +34,9 @@ prefilter:
   store_results: false
   pass_classes: [2]
   model:
-    arch: "r50_1x_sk0"
+    arch: r50_1x_sk0
     num_classes: 10
     pretrain: null
 
 workers: 2
-device: "cpu" # Default to CPU for broader demo compatibility
+device: cpu # Default to CPU for broader demo compatibility

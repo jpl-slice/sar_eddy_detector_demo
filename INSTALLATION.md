@@ -49,7 +49,7 @@ conda activate sar_eddy_env
 Install the necessary dependencies using Conda from the `conda-forge` channel:
 
 ```bash
-conda install pandas rasterio libgdal geopandas shapely tqdm pyyaml scikit-learn xgboost -c conda-forge
+conda install pandas rasterio libgdal geopandas shapely tqdm pyyaml scikit-learn xgboost hydra-core hyp3_sdk -c conda-forge
 conda install pytorch torchvision -c conda-forge
 conda install timm -c conda-forge
 ```
@@ -112,7 +112,7 @@ pip install -e .
 After setting up your environment using either method, verify the installation by running the demo pipeline:
 
 ```bash
-python src/main.py --config config/inference.yaml
+python src/main.py
 ```
 
 This command should execute the demo and output logs to the console, confirming that all dependencies are correctly installed.

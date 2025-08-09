@@ -13,6 +13,24 @@ from src.eddy_detector.base_detector import BaseEddyDetector
 from src.transforms import ClipNormalizeCastToUint8
 
 
+class CombinedMaskingTransform:
+    def __init__(self, nodata_value, img_transform, mask_transform):
+        self.nodata_value = nodata_value
+        self.img_transform = img_transform
+        self.mask_transform = mask_transform
+
+    def __call__(self, img):
+        arr = np.array(img)
+        condition = (arr == self.nodata_value) | np.isnan(arr)
+        mask = Image.fromarray(condition.astype(np.uint8) * 255)
+
+        img_transformed = self.img_transform(img)
+        mask_transformed = self.mask_transform(mask)
+
+        img_transformed[mask_transformed > 0] = self.nodata_value
+        return img_transformed
+
+
 class TimmXGBoostEddyDetector(BaseEddyDetector):
     """Eddy detector using TIMM feature extractor and scikit-learn pipeline."""
 
@@ -78,7 +96,11 @@ class TimmXGBoostEddyDetector(BaseEddyDetector):
             transform.transforms.insert(0, ClipNormalizeCastToUint8())
             transform.transforms.insert(1, transforms.ToPILImage())
             print(f"Using the following transforms: {transform.transforms}")
-            return self._make_combined_transform(transform, mask_transforms)
+            return CombinedMaskingTransform(
+                nodata_value=self.config.nodata_value,
+                img_transform=transform,
+                mask_transform=mask_transforms,
+            )
         except Exception as e:
             print(
                 f"[{self.class_name}] Error creating TIMM transform: {e}. Check timm version compatibility."
@@ -100,18 +122,6 @@ class TimmXGBoostEddyDetector(BaseEddyDetector):
                 transform.transforms.insert(
                     0, transforms.Grayscale(num_output_channels=3)
                 )  # Indicate failure
-
-    def _make_combined_transform(self, img_transform, mask_transform):
-        def combined_transform(img):
-            arr = np.array(img)
-            condition = (arr == self.config.nodata_value) | np.isnan(arr)
-            mask = Image.fromarray(condition.astype(np.uint8) * 255)
-            img_transformed = img_transform(img)
-            mask_transformed = mask_transform(mask)  # This should yield a tensor mask.
-            img_transformed[mask_transformed > 0] = self.config.nodata_value
-            return img_transformed
-
-        return combined_transform
 
     def _predict_batch(
         self, images: torch.Tensor
