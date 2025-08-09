@@ -24,7 +24,7 @@ from rasterio.warp import transform_geom
 from scipy import ndimage
 from shapely.geometry import box, mapping
 
-from src.utils.raster_io import read_raster_data
+from src.utils.raster_io import read_raster_data, get_nodata_from_src
 
 MASK_VALUE = 0.0  # value committed to disk
 
@@ -91,7 +91,7 @@ def mask_land_and_clip(
             src, shapes_utm, invert=True, nodata=np.nan, filled=True, crop=False
         )
         out = masked_arr[0].astype("float32")
-        out[out == _get_nodata(src)] = np.nan  # ensure nodata is NaN
+        out[out == get_nodata_from_src(src)] = np.nan  # ensure nodata is NaN
 
     if dilate_px > 0:
         out = dilate_land_mask(out, dilate_px)
@@ -126,18 +126,3 @@ def _native_bounds_as_ll(
 ) -> tuple[float, float, float, float]:
     """Return (left, bottom, right, top) in EPSG:4326."""
     return rasterio.warp.transform_bounds(src.crs, "EPSG:4326", *src.bounds)  # type: ignore[arg-type]
-
-
-def _get_nodata(src: rasterio.DatasetReader) -> float:
-    """Robust nodata detection"""
-    if src.nodata is not None:
-        return float(src.nodata)
-    # Heuristic sample (≤128×128) from UL corner
-    data = src.read(1)
-    # return -9999.0 if np.any(sample < -9000) else NODATA_DEFAULT
-    if np.any(data < -9000):
-        return -9999.0
-    elif np.any(np.isnan(data)):
-        return np.nan
-    else:
-        return 0.0  # default nodata value
