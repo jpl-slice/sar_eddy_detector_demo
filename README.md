@@ -55,7 +55,7 @@ flowchart TD
     C --> D --> E --> F
     F --> G --> H
     H --> I --> J
-````
+```
 
 ## Quick Start
 
@@ -157,7 +157,7 @@ This structure ensures that:
   - Each component is self-contained with its required paths
   - Global paths can be overridden per-component
   - CLI overrides work intuitively
-  - Workflow transitions (HyP3 -\> Preprocessing -\> Inference) are seamless
+  - Workflow transitions (HyP3 -> Preprocessing -> Inference) are seamless
 
 ### Configuration Groups
 
@@ -182,6 +182,7 @@ python src/main.py mode=full inference=timm_xgb \
   hyp3.granules='["S1A_IW_GRDH_1SDV_20250107T020747_20250107T020812_057332_070E18_F91B", "S1A_IW_GRDH_1SDV_20250114T015820_20250114T015849_057434_071221_90CF"]'
 ```
 Here, `inference=timm_xgb` uses `config/inference/timm_xgb.yaml` for the TIMM+XGBoost model.
+
 **Skip HyP3 Download** (use existing processed data):
 
 ```bash
@@ -210,9 +211,52 @@ python src/main.py mode=inference_only inference=timm_xgb \
   inference.output_dir=output/experiment_1
 ```
 
+### Large Granule Lists (Hydra-friendly)
+
+For very large batches (e.g., 10,000 granules), avoid pasting lists on the CLI or editing `config/hyp3/default.yaml`. Instead, create a **granule list config** and point Hydra at it:
+
+
+1)  Create **`config/hyp3/granules_batch.yaml`** that *extends* the base `hyp3/default.yaml` and only overrides the `granules` list:
+
+```yaml
+# config/hyp3/granules_batch.yaml
+defaults:
+  - default  # inherit hyp3/default.yaml
+
+granules:
+  - S1A_IW_GRDH_1SDV_20190105T135220_20190105T135245_025343_02CE16_D8E2
+  - S1A_IW_GRDH_1SDV_20190105T135245_20190105T135310_025343_02CE16_2590
+  # ... thousands more
+```
+
+2) Use `granules_batch` in place of `default` in your CLI command:
+```bash
+# If the file is inside this repo:
+python src/main.py hyp3=granules_batch
+
+# If the file lives outside the repo:
+python src/main.py --config-dir /path/to/my-configs hyp3=granules_batch
+```
+
+This keeps all keys from `hyp3/default.yaml` (e.g., `job_parameters`) and replaces only `granules`. Learn more: **[Extending Configs](https://hydra.cc/docs/patterns/extending_configs/)**.
+
+#### Option B — Compose both options from the group on the CLI
+
+Select **both** `default` and your `granules_batch` at runtime so they compose (with your batch list applied last):
+
+```bash
+# Inside the repo
+python src/main.py hyp3=[default,granules_batch]
+
+# Using an external config directory
+python src/main.py --config-dir /path/to/my-configs hyp3=[default,granules_batch]
+```
+
+This keeps everything from `default` and overrides only the `granules` key from `granules_batch`. Learn more: **[Selecting multiple configs from a Config Group](https://hydra.cc/docs/patterns/select_multiple_configs_from_config_group)**.
+
 ## CLI Overrides
 
-The configuration system supports powerful command-line overrides:
+You can override any configuration parameter at runtime using dot-notation.
 
 ### Path Overrides
 
@@ -258,53 +302,6 @@ python src/main.py mode=full \
   inference=timm_xgb
 ```
 
-```bash
-python src/main.py mode=inference_only batch_size=256
-```
-
-## CLI Overrides
-
-You can override any configuration parameter at runtime using dot-notation:
-
-### Common Parameter Overrides
-
-```bash
-# Change detection model
-python src/main.py inference=timm_xgb
-
-# Adjust processing performance
-python src/main.py batch_size=64 device=cpu workers=4
-
-# Modify output location
-python src/main.py paths.output_dir=/custom/output/path
-
-# Override dataset tiling parameters
-python src/main.py dataset_params.window_size=512 dataset_params.stride_factor=0.5
-
-# Change preprocessing settings
-python src/main.py preprocessing.clip_percentile=95 preprocessing.convert_to_db=false
-
-# Update HyP3 job parameters
-python src/main.py hyp3.job_parameters.resolution=10
-```
-
-### Advanced Configuration Examples
-
-```bash
-# Complete experimental run
-python src/main.py inference=timm_xgb batch_size=128 device=cuda \
-  paths.output_dir=results/experiment_1
-
-# Debug mode with detailed logging
-python src/main.py debug=true mode=inference_only
-
-# Custom granule processing
-python src/main.py mode=full \
-  hyp3.granules='["S1A_IW_GRDH_1SDV_20240101T120000_20240101T120025_056789_06E123_1234"]' \
-  preprocessing.dilate_px=8 \
-  preprocessing.masked_dtype=uint16
-```
-
 ## Directory Structure
 
 For complete project layout details, see [STRUCTURE.md](STRUCTURE.md).
@@ -316,7 +313,6 @@ For complete project layout details, see [STRUCTURE.md](STRUCTURE.md).
   - **`src/sar_utils/`**: HyP3 download & preprocessing modules
   - **`src/eddy_detector/`**: Detection model implementations
   - **`src/models/`**: Model loading utilities
-  - **`config/`**: Legacy configuration files (deprecated)
 
 ## Workflow Modes
 
@@ -324,8 +320,8 @@ The `mode` parameter controls which processing stages to execute:
 
 | Mode | Stages | Use Case |
 |------|--------|----------|
-| `full` | Download -\> Preprocess -\> Detect | Complete end-to-end processing |
-| `hyp3_only` | Download -\> Preprocess | Data preparation and validation |
+| `full` | Download -> Preprocess -> Detect | Complete end-to-end processing |
+| `hyp3_only` | Download -> Preprocess | Data preparation and validation |
 | `inference_only` | Detect only | Model testing and evaluation |
 
 ## Outputs
