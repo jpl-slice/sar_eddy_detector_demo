@@ -11,6 +11,8 @@ granules:
   # - "S1A_IW_GRDH_1SDV_20190105T135335_20190105T135400_025343_02CE16_1207"
 
 keep_zip: false
+max_parallel_jobs: 32
+connection_pool_maxsize: 64
 
 # HyP3 RTC Job Parameters
 job_parameters:

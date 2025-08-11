@@ -14,6 +14,56 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import hyp3_sdk
+from hyp3_sdk.exceptions import HyP3Error
+
+
+def rtc_default_job_parameters() -> dict:
+    return dict(
+        dem_name="copernicus",
+        resolution=30,
+        radiometry="sigma0",
+        scale="power",
+        speckle_filter=True,
+        dem_matching=False,
+        include_dem=False,
+        include_inc_map=False,
+        include_rgb=False,
+        include_scattering_area=False,
+    )
+
+
+# Optional: tune HTTP pool and retries for high concurrency
+def configure_http_pool(
+    client: hyp3_sdk.HyP3,
+    pool_maxsize: int = 64,
+    max_retries: int = 32,
+    backoff_factor: float = 2,
+):
+    """Increase underlying requests session connection pool and set simple retries."""
+    try:
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+    except Exception as e:
+        logging.warning(f"Could not import HTTPAdapter/Retry to configure pool: {e}")
+        return
+
+    retry = Retry(
+        total=max_retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=[429, 500, 502, 503, 504],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        pool_connections=pool_maxsize,
+        pool_maxsize=pool_maxsize,
+        max_retries=retry,
+    )
+    client.session.mount("https://", adapter)
+    client.session.mount("http://", adapter)
+    logging.info(
+        f"Configured HyP3 HTTP pool: pool_maxsize={pool_maxsize}, "
+        f"retries={max_retries}, backoff_factor={backoff_factor}"
+    )
 
 
 def initialize_hyp3_client(
@@ -30,15 +80,23 @@ def initialize_hyp3_client(
         return hyp3_sdk.HyP3(prompt="password")  # Prompt as last resort
 
 
-def display_account_statistics(client: hyp3_sdk.HyP3):
+def display_account_statistics(
+    client: hyp3_sdk.HyP3, job_parameters: Optional[dict] = None
+):
     """Display account information and recent job statistics."""
     try:
         credits = client.check_credits()
         costs = client.costs()
-        rtc_cost = costs.get("RTC_GAMMA", {}).get("cost", "Unknown")
+        params = job_parameters or rtc_default_job_parameters()
+        res = int(params.get("resolution", 30))
+        rtc_cost = get_rtc_job_cost_from_costs(costs, res)
 
         logging.info(f"Remaining credits: {credits}")
-        logging.info(f"RTC job cost: {rtc_cost} credits each")
+        if rtc_cost is not None:
+            logging.info(f"RTC job cost (@ resolution {res} m): {rtc_cost} credits")
+        else:
+            table = costs.get("RTC_GAMMA", {}).get("cost_table")
+            logging.info(f"RTC costs by resolution: {table}")
 
         recent_jobs = client.find_jobs()
         if recent_jobs:
@@ -52,6 +110,59 @@ def display_account_statistics(client: hyp3_sdk.HyP3):
 
     except Exception as e:
         logging.warning(f"Could not retrieve account statistics: {e}")
+
+
+def plan_rtc_submissions(
+    client: hyp3_sdk.HyP3, granules: List[str], job_parameters: Optional[dict]
+) -> Tuple[List[str], List[str], Optional[float], Optional[float]]:
+    """Partition granules into existing vs new and log a credit summary."""
+    params = job_parameters or rtc_default_job_parameters()
+    existing, new = [], []
+    for g in granules:
+        if find_existing_job(client, g, params):
+            existing.append(g)
+        else:
+            new.append(g)
+
+    rtc_cost, credits = None, None
+    try:
+        credits = client.check_credits()
+        res = int(params.get("resolution", 30))
+        rtc_cost = get_rtc_job_cost(client, res)
+    except Exception as e:
+        logging.warning(f"Could not get costs/credits: {e}")
+
+    total_req = len(granules)
+    exist_cnt, new_cnt = len(existing), len(new)
+    total_needed = new_cnt * rtc_cost if rtc_cost is not None else None
+
+    logging.info("HyP3 account and plan summary:")
+    logging.info(f"- Total requested granules: {total_req}")
+    logging.info(f"- Existing usable jobs: {exist_cnt}")
+    logging.info(f"- New submissions required: {new_cnt}")
+    if rtc_cost is not None:
+        logging.info(f"- RTC job cost per new submission: {rtc_cost}")
+        logging.info(f"- Total required credits for new submissions: {total_needed}")
+    if credits is not None:
+        logging.info(f"- Remaining credits: {credits}")
+
+    return existing, new, rtc_cost, credits
+
+
+def get_rtc_job_cost(client: hyp3_sdk.HyP3, resolution: int) -> Optional[float]:
+    try:
+        costs = client.costs()
+        return get_rtc_job_cost_from_costs(costs, resolution)
+    except Exception:
+        return None
+
+
+def get_rtc_job_cost_from_costs(costs: dict, resolution: int) -> Optional[float]:
+    rtc = costs.get("RTC_GAMMA", {})
+    table = rtc.get("cost_table")
+    if isinstance(table, dict):
+        return table.get(str(int(resolution)))
+    return None
 
 
 def fetch_tif_from_hyp3(
@@ -119,11 +230,25 @@ def get_or_submit_rtc_job(
         return existing_job
 
     logging.info(f"Submitting new RTC job for granule: {granule}")
-    batch = client.submit_rtc_job(
-        granule=granule, name=f"RTC_{granule[-8:]}", **job_parameters
-    )
-    # Handle batch or single job return
-    return batch if hasattr(batch, "job_id") else (batch[0] if batch else None)
+    try:
+        batch = client.submit_rtc_job(
+            granule=granule, name=f"RTC_{granule[-8:]}", **job_parameters
+        )
+    except HyP3Error as e:
+        msg = str(e)
+        if "DEM coverage" in msg:
+            log_job_failure(
+                granule,
+                f"{e} Some requested scenes do not have DEM coverage. Skipping RTC.",
+            )
+            return None
+        raise
+
+    # submit_rtc_job returns a Batch; return the first Job
+    try:
+        return batch[0]
+    except Exception:
+        raise
 
 
 def find_existing_job(

@@ -2,10 +2,24 @@
 """
 Unified orchestrator for SAR eddy detection using Hydra configuration management.
 Supports full workflow (HyP3 download + preprocessing + inference) or individual stages.
+
+Example Usage:
+
+python src/main.py \
+    hyp3=granules \
+    inference=timm_xgb \
+    inference.device=cuda \
+    inference.batch_size=256 \
+    paths.download_dir=$SCRATCH/sar_eddy_data/downloaded \
+    paths.processed_dir=$SCRATCH/sar_eddy_data/processed \
+    paths.preview_dir=$SCRATCH/sar_eddy_data/previews \
+    paths.output_dir=$SCRATCH/sar_eddy_data/output
+
 """
 import logging
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import hydra
@@ -15,7 +29,12 @@ from omegaconf import DictConfig, OmegaConf
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.sar_utils import build_land_masker, initialize_hyp3_client
-from src.sar_utils.download_rtc_from_hyp3 import fetch_tif_from_hyp3
+from src.sar_utils.download_rtc_from_hyp3 import (
+    configure_http_pool,
+    display_account_statistics,
+    fetch_tif_from_hyp3,
+    plan_rtc_submissions,
+)
 from src.sar_utils.preprocess_land_mask_and_normalize import preprocess_frame
 from src.utils import load_class
 
@@ -51,14 +70,48 @@ def setup_logging(cfg: DictConfig) -> None:
 
 
 def run_hyp3_workflow(cfg: DictConfig) -> None:
-    """Run HyP3 download and preprocessing workflow."""
+    """Run HyP3 download and preprocessing workflow with parallel granule processing."""
     logging.info("Starting HyP3 download and preprocessing workflow")
 
     hyp3_client = initialize_hyp3_client(cfg.hyp3.username, cfg.hyp3.password)
+
+    # Optionally increase HTTP pool size to avoid urllib3 pool warnings at high concurrency
+    pool_maxsize = getattr(cfg.hyp3, "connection_pool_maxsize", None)
+    if pool_maxsize:
+        configure_http_pool(hyp3_client, int(pool_maxsize))
+
+    # Show account summary and plan before submitting jobs
+    granules = list(cfg.hyp3.granules)
+    if not granules:
+        logging.warning("No granules specified in configuration.")
+        return
+
+    job_params = dict(cfg.hyp3.job_parameters) if cfg.hyp3.job_parameters else None
+    display_account_statistics(hyp3_client, job_params)
+    _existing, _new, _rtc_cost, _credits = plan_rtc_submissions(
+        hyp3_client, granules, job_params
+    )
+
     land_masker = build_land_masker(cfg.preprocessing.land_shapefile)
 
-    for granule in cfg.hyp3.granules:
-        run_granule_workflow(granule, hyp3_client, land_masker, cfg)
+    max_workers = int(getattr(cfg.hyp3, "max_parallel_jobs", 16))
+    logging.info(
+        f"Queuing {len(granules)} granules with up to {max_workers} parallel jobs"
+    )
+
+    # Process each granule in parallel; each task performs download + preprocess
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_granule = {
+            executor.submit(run_granule_workflow, g, hyp3_client, land_masker, cfg): g
+            for g in granules
+        }
+        for future in as_completed(future_to_granule):
+            granule = future_to_granule[future]
+            try:
+                future.result()
+                logging.info(f"Completed workflow for granule: {granule}")
+            except Exception as e:
+                logging.exception(f"Workflow failed for granule {granule}: {e}")
 
 
 def run_granule_workflow(
