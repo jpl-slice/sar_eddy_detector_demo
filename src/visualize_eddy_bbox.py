@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import rasterio
+from PIL import Image
 from rasterio.enums import Resampling
 from rasterio.windows import Window
 
@@ -153,14 +154,7 @@ class EddyVisualizer:
                             )
                             if window_data is None:
                                 continue
-                            self._plot_and_save_individual_preview(
-                                data=window_data,
-                                src_transform=src.transform,
-                                window=window,
-                                bbox=bbox,
-                                confidence=confidence,
-                                output_path=output_path,
-                            )
+                            self._save_png_crop(window_data, output_path)
                         except Exception as inner_e:
                             print(
                                 f"  Error processing detection index {i} for {filename}: {inner_e}"
@@ -227,58 +221,66 @@ class EddyVisualizer:
         patch_size: int,
     ) -> Optional[Window]:
         """
-        Given a lon/lat bbox (lon_min, lat_min, lon_max, lat_max),
-        reproject it into the src CRS, compute the pixel window,
-        buffer it, clamp to the image, and ensure at least patch_size.
+        Given a WGS84 bbox (lon_min, lat_min, lon_max, lat_max),
+        compute a full-resolution pixel Window in the dataset's CRS using
+        transform_bounds + from_bounds, then:
+        - add a pixel buffer,
+        - clamp with windows.intersection,
+        - enforce a minimum patch size within dataset bounds.
+
+        Returns None if the resulting window is empty.
         """
         try:
-            # 1. Unpack longitude/latitude bounds
             lon_min, lat_min, lon_max, lat_max = bbox
+            # Normalize bbox ordering
+            left_ll = min(lon_min, lon_max)
+            right_ll = max(lon_min, lon_max)
+            bottom_ll = min(lat_min, lat_max)
+            top_ll = max(lat_min, lat_max)
 
-            # 2. Reproject from WGS84 → src.crs (if needed)
-            src_crs = src.crs or rasterio.crs.CRS.from_epsg(4326)
-            if src_crs.to_epsg() != 4326:
-                xs, ys = rasterio.warp.transform(
-                    rasterio.crs.CRS.from_epsg(4326),
-                    src_crs,
-                    [lon_min, lon_max],
-                    [lat_max, lat_min],
+            # Always transform bounds; no-ops if CRSes are equal.
+            dst_crs = src.crs if src.crs else "EPSG:4326"
+            left, bottom, right, top = rasterio.warp.transform_bounds(
+                "EPSG:4326", dst_crs, left_ll, bottom_ll, right_ll, top_ll
+            )
+
+            # Convert CRS-aligned bounds to a pixel window and round to pixel grid
+            win = (
+                rasterio.windows.from_bounds(
+                    left, bottom, right, top, transform=src.transform
                 )
-                x0, x1 = xs
-                y0, y1 = ys
-            else:
-                x0, x1 = lon_min, lon_max
-                y0, y1 = (
-                    lat_max,
-                    lat_min,
-                )  # note: index wants (x, y) pairs as (col, row)
+                .round_offsets()
+                .round_lengths()
+            )
 
-            # 3. Convert reprojected corner coords into pixel indices
-            col0, row0 = src.index(x0, y0)  # top‐left
-            col1, row1 = src.index(x1, y1)  # bottom‐right
+            # Apply pixel buffer
+            buffered = Window(
+                max(0, int(win.col_off) - buffer),
+                max(0, int(win.row_off) - buffer),
+                int(win.width) + 2 * buffer,
+                int(win.height) + 2 * buffer,
+            )
 
-            # 4. Add buffer & sort
-            row_start, row_end = sorted([row0 - buffer, row1 + buffer])
-            col_start, col_end = sorted([col0 - buffer, col1 + buffer])
+            # Clamp to dataset extent using intersection
+            full = Window(0, 0, src.width, src.height)
+            try:
+                clamped = rasterio.windows.intersection(buffered, full)
+            except Exception:
+                return None
 
-            # 5. Clamp to image bounds
-            row_start = max(0, row_start)
-            col_start = max(0, col_start)
-            row_end = min(src.height, row_end)
-            col_end = min(src.width, col_end)
-
+            # fmt: off
             row_start, row_end = self._ensure_min_patch_size(
-                row_start, row_end, patch_size, src.height
+                int(clamped.row_off), int(clamped.row_off + clamped.height), patch_size, src.height
             )
             col_start, col_end = self._ensure_min_patch_size(
-                col_start, col_end, patch_size, src.width
+                int(clamped.col_off), int(clamped.col_off + clamped.width), patch_size, src.width
             )
+            # fmt: on
 
-            # 6. Check for valid window
+            # Check for valid window
             if row_end <= row_start or col_end <= col_start:
                 return None
 
-            # 7. Return a Window built from row/col slices
             return Window.from_slices((row_start, row_end), (col_start, col_end))
         except Exception as e:
             print(f"[{self.class_name}] Error calculating preview window: {e}")
@@ -307,46 +309,25 @@ class EddyVisualizer:
             print(f"[{self.class_name}] Error reading window data: {e}")
             return None
 
-    def _plot_and_save_individual_preview(
-        self,
-        data: np.ndarray,
-        src_transform,
-        window: Window,
-        bbox: Tuple,
-        confidence: float,
-        output_path: Path,
-    ) -> None:
-        fig, ax = plt.subplots(1, figsize=(10, 10))
-        try:
-            window_transform = rasterio.windows.transform(window, src_transform)
-            left_plot, top_plot = window_transform * (0, 0)
-            right_plot, bottom_plot = window_transform * (window.width, window.height)
+    def _save_png_crop(self, data: np.ndarray, out_path: Path) -> None:
+        # Accepts either (H, W) uint8 grayscale, or (C, H, W) / (H, W, C)
+        arr = data
+        if arr.ndim == 3 and arr.shape[0] in (1, 3, 4):  # (C, H, W) -> (H, W, C)
+            arr = np.moveaxis(arr, 0, -1)
+        if arr.dtype != np.uint8:
+            # Keep this simple: if normalize was skipped, fallback to simple 0–255 scaling
+            arr = self.normalizer(arr)
 
-            # Handle both normalized (uint8) and non-normalized (float) data
-            is_normalized_uint8 = data.dtype == np.uint8
-            vmax = 255 if is_normalized_uint8 else float(np.nanpercentile(data, 98))
-            vmin = 0 if is_normalized_uint8 else float(np.nanmin(data))
+        if arr.ndim == 2:
+            img = Image.fromarray(arr, mode="L")
+        elif arr.ndim == 3 and arr.shape[2] in (3, 4):
+            mode = "RGB" if arr.shape[2] == 3 else "RGBA"
+            img = Image.fromarray(arr, mode=mode)
+        else:
+            # Fallback: pick first band
+            img = Image.fromarray(arr[..., 0].astype(np.uint8), mode="L")
 
-            ax.imshow(
-                data,
-                cmap="gray",
-                extent=(left_plot, right_plot, bottom_plot, top_plot),
-                vmin=vmin,
-                vmax=vmax,
-            )
-            ax.ticklabel_format(useOffset=False, style="plain")
-            # ax.set_title(f"Confidence: {confidence:.3f}")
-            ax.set_xlabel("Longitude")
-            ax.set_ylabel("Latitude")
-            # set axis off
-            ax.set_axis_off()
-            plt.tight_layout()
-            plt.savefig(output_path, bbox_inches="tight", pad_inches=0)
-        except Exception as e:
-            print(f"[{self.class_name}] Error plotting/saving preview: {e}")
-            traceback.print_exc()
-        finally:
-            plt.close(fig)
+        img.save(out_path)
 
     def _create_preview_with_boxes(
         self,

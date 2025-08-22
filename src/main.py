@@ -173,7 +173,7 @@ def run_inference_workflow(cfg: DictConfig) -> None:
 
         # Create individual previews for each detection
         detector.save_positive_detection_tiles(
-            confidence_threshold=0.5, merged=False, patch_size=256
+            confidence_threshold=0.5, merged=True, patch_size=256
         )
 
 
