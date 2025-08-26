@@ -168,12 +168,19 @@ def run_inference_workflow(cfg: DictConfig) -> None:
         logging.info(f"Inference complete. Results saved in: {output_dir}")
 
         # TODO: make confidence threshold configurable via command line or YAML
+        split_by_class = bool(getattr(cfg.inference, "split_preview_by_class", False))
         # Create overall previews
-        detector.create_scene_previews_with_bbox(confidence_threshold=0.5, merged=True)
+        detector.visualizer.create_scene_previews_with_bbox(
+            confidence_threshold=0.5, merged=True, split_by_class=split_by_class
+        )
 
         # Create individual previews for each detection
-        detector.save_positive_detection_tiles(
-            confidence_threshold=0.5, merged=True, patch_size=256
+        detector.visualizer.save_positive_detection_tiles(
+            confidence_threshold=0.5,
+            merged=True,
+            patch_size=256,
+            split_scenes_into_folders=True,
+            split_by_class=split_by_class,
         )
 
 

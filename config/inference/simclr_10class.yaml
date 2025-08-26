@@ -1,0 +1,27 @@
+defaults:
+  - default
+
+# Keep SimCLR path; switch to 10 classes and enable multi-class positives
+detector_class_name: "SimCLREddyDetector"
+model_loader_class: "src.models.simclr_loader.SimCLRLoader"
+arch: "r50_1x_sk0"
+
+# Classification settings
+num_classes: 10
+pretrain: "model_checkpoints/10class_checkpoint.tar"
+
+# Optional: class names to label previews/CSVs
+class_names:
+  - pure ocean waves
+  - wind streaks
+  - micro convective cells
+  - rain cells
+  - biological slicks
+  - sea ice
+  - icebergs
+  - low wind area
+  - atmospheric front
+  - oceanic front
+
+# Visualization options
+split_preview_by_class: true

@@ -57,6 +57,9 @@ class BaseEddyDetector(abc.ABC):
         self._merged_csv_path: Optional[Path] = None
         self.visualizer = EddyVisualizer(self)
 
+        # Optional class names for mapping indices to human-readable labels
+        self.class_names: Optional[List[str]] = None
+
     @abc.abstractmethod
     def _create_transform(self) -> Optional[transforms.Compose]:
         """
@@ -111,6 +114,16 @@ class BaseEddyDetector(abc.ABC):
         additional setup (e.g., pipelines, transforms) as needed.
         """
         self.model, self.input_size, self.interpolation_mode = self._load_model()
+
+        # Capture optional class_names from config for downstream labeling
+        if hasattr(self.config, "class_names") and self.config.class_names:
+            try:
+                self.class_names = list(self.config.class_names)
+                assert (
+                    len(self.class_names) == self.config.num_classes
+                ), f"Expected {self.config.num_classes} class names, got {self.class_names}"
+            except Exception:
+                self.class_names = None
         return self.model is not None
 
     def _load_model(self):
@@ -244,10 +257,6 @@ class BaseEddyDetector(abc.ABC):
             probability: Confidence score of the predicted class.
             metadata: Additional metadata including filename and bounding box.
         """
-        # Only handle detections that correspond to the positive class.
-        if prediction != self.config.positive_class_index:
-            return
-
         # Extract filename and bounding box from metadata. Use a default if missing
         # Ensure filename is just the basename
         filename = Path(metadata.get("filename", "unknown_file")).name
@@ -259,13 +268,19 @@ class BaseEddyDetector(abc.ABC):
             else np.array(bbox_tensor)
         )
         # Append the detection details to the positive detections list
-        self.positive_detections.append(
-            {
-                "filename": filename,
-                "bbox": bbox,
-                "confidence": float(probability),
-            }
-        )
+        row = {
+            "filename": filename,
+            "bbox": bbox,
+            "confidence": float(probability),
+        }
+        if self.is_multiclass():
+            row["pred_class"] = int(prediction)
+            if self.class_names and 0 <= int(prediction) < len(self.class_names):
+                row["pred_label"] = str(self.class_names[int(prediction)])
+        self.positive_detections.append(row)
+
+    def is_multiclass(self):
+        return self.config.num_classes is not None and self.config.num_classes > 1
 
     def _save_detection_results(self) -> None:
         """
@@ -290,25 +305,27 @@ class BaseEddyDetector(abc.ABC):
 
         # If no positive detections were found, save empty CSVs
         if not self.positive_detections:
-            print(
-                f"[{self.class_name}] No positive detections found. Saving empty CSV."
-            )
-            # Use standard bbox column name for empty files too
-            df = pd.DataFrame(columns=["filename", bbox_col_name, "confidence"])
-            df.to_csv(self._base_csv_path, index=False)
+            self.save_empty_csv(bbox_col_name, self._base_csv_path)
             return
 
         # Create a DataFrame from the detected results
         df = pd.DataFrame(self.positive_detections)
         # Convert bounding box arrays into space-separated strings under the standard column name.
         df[bbox_col_name] = df["bbox"].apply(lambda x: " ".join(map(str, x)))
-        # Save the detection results as a CSV, selecting appropriate columns.
-        df[["filename", bbox_col_name, "confidence"]].to_csv(
-            self._base_csv_path, index=False
-        )
+        # Save the detection results as a CSV
+        df.to_csv(self._base_csv_path, index=False)
         print(
             f"[{self.class_name}] Saved {len(self.positive_detections)} positive detections to: {self._base_csv_path}"
         )
+
+    def save_empty_csv(self, bbox_col_name, csv_filepath):
+        print(f"[{self.class_name}] No positive detections found. Saving empty CSV.")
+        # Use standard bbox column name for empty files too
+        columns = ["filename", bbox_col_name, "confidence"]
+        if self.is_multiclass():
+            columns.append("pred_class")
+        df = pd.DataFrame(columns=columns)  # empty df
+        df.to_csv(csv_filepath, index=False)
 
     def _merge_and_save_detections(self, bbox_col_name="bbox") -> None:
         """Merges bounding boxes from the raw detections CSV and saves them to a new file."""
@@ -319,24 +336,23 @@ class BaseEddyDetector(abc.ABC):
             )
             return
 
+        if self._base_csv_path is None:
+            print(f"[{self.class_name}] Base CSV path is not set. Skipping merge.")
+            return
         self._merged_csv_path = self._base_csv_path.with_name(
             self._base_csv_path.stem + "_merged.csv"
         )
 
         if not self.positive_detections:
             # Create an empty merged file as well
-            df = pd.DataFrame(columns=["filename", bbox_col_name, "confidence"])
-            df.to_csv(self._merged_csv_path, index=False)
-            print(
-                f"[{self.class_name}] Saved empty merged detection file to: {self._merged_csv_path}"
-            )
+            self.save_empty_csv(bbox_col_name, self._merged_csv_path)
             return
 
         try:
             # Extract bbox merging parameters from config
             bbox_config = getattr(self.config, "bbox_merging", {})
             merged_results = merge_csv_bboxes(
-                self._base_csv_path,
+                str(self._base_csv_path),
                 nms_iou_threshold=bbox_config.get("nms_iou_threshold", 0.05),
                 merge_iou_threshold=bbox_config.get("merge_iou_threshold", 0.3),
                 post_nms_iou_threshold=bbox_config.get("post_nms_iou_threshold", 0.1),
@@ -348,25 +364,21 @@ class BaseEddyDetector(abc.ABC):
                     # Convert bounding box to string for saving
                     bbox_str = " ".join(map(str, detection["bbox"]))
                     merged_list.append(
-                        {
-                            "filename": filename,
-                            bbox_col_name: bbox_str,
-                            "confidence": detection["confidence"],
-                        }
+                        {"filename": filename, bbox_col_name: bbox_str, **detection}
                     )
 
             if merged_list:  # only save if merging produced results
                 merged_df = pd.DataFrame(merged_list)
+                # Ensure pred_class column exists for acceptance; fill with NA if absent
+                if self.is_multiclass() and "pred_class" not in merged_df.columns:
+                    merged_df["pred_class"] = pd.NA
                 merged_df.to_csv(self._merged_csv_path, index=False)
                 print(
                     f"[{self.class_name}] Saved {len(merged_df)} merged detections to: {self._merged_csv_path}"
                 )
-            else:
+            else:  # the block below triggers if `merge_csv_bboxes` somehow returns []
                 print(f"[{self.class_name}] No overlapping boxes to merge.")
-                # Save an empty file if no boxes were merged
-                pd.DataFrame(columns=["filename", bbox_col_name, "confidence"]).to_csv(
-                    self._merged_csv_path, index=False
-                )
+                self.save_empty_csv(bbox_col_name, self._merged_csv_path)
 
         except FileNotFoundError:
             print(

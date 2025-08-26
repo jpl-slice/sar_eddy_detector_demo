@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 import rasterio
 from PIL import Image
+import rasterio.warp
+import rasterio.windows
 from rasterio.enums import Resampling
 from rasterio.windows import Window
 
@@ -27,7 +29,12 @@ class EddyVisualizer:
         self.class_name = self.__class__.__name__
         self.normalizer = ClipNormalizeCastToUint8()
 
-    def create_scene_previews_with_bbox(self, confidence_threshold=0.99, merged=False):
+    def create_scene_previews_with_bbox(
+        self,
+        confidence_threshold=0.99,
+        merged=False,
+        split_by_class: bool = False,
+    ):
         df = self._load_and_prepare_detections_df(merged, confidence_threshold)
         if df is None:
             return
@@ -60,6 +67,41 @@ class EddyVisualizer:
             boxes_for_file = file_df["bbox_parsed"].tolist()
             confidences = file_df["confidence"].astype(float).tolist()
             try:
+                # If split_by_class, create subfolders per class for this scene's outputs
+                if split_by_class and (
+                    "pred_class" in file_df.columns or "pred_label" in file_df.columns
+                ):
+                    classes = file_df[
+                        [
+                            c
+                            for c in ["pred_label", "pred_class"]
+                            if c in file_df.columns
+                        ][0]
+                    ].unique()
+                    for cls_val in classes:
+                        cls_df = file_df[
+                            (
+                                (file_df.get("pred_label") == cls_val)
+                                if "pred_label" in file_df.columns
+                                else (file_df["pred_class"] == cls_val)
+                            )
+                        ]
+                        cls_boxes = cls_df["bbox_parsed"].tolist()
+                        cls_confs = cls_df["confidence"].astype(float).tolist()
+                        sub = output_dir / f"class_{cls_val}"
+                        sub.mkdir(parents=True, exist_ok=True)
+                        out = sub / f"{file_path.stem}_preview.png"
+                        self._create_preview_with_boxes(
+                            str(file_path),
+                            cls_boxes,
+                            str(out),
+                            confidences=cls_confs,
+                            confidence_threshold=confidence_threshold,
+                            scale_factor=0.1,
+                        )
+                    processed_files_count += 1
+                    continue
+
                 output_image_path = output_dir / f"{file_path.stem}_preview.png"
                 self._create_preview_with_boxes(
                     str(file_path),
@@ -92,6 +134,7 @@ class EddyVisualizer:
         bbox_buffer_pixels=32,
         normalize_window=True,
         split_scenes_into_folders=True,
+        split_by_class: bool = False,
     ) -> None:
         df = self._load_and_prepare_detections_df(merged, confidence_threshold)
         if df is None:
@@ -136,29 +179,53 @@ class EddyVisualizer:
 
             try:
                 with rasterio.open(file_path) as src:
-                    for i, detection in group.iterrows():
-                        bbox = detection["bbox_parsed"]
-                        confidence = detection["confidence"]
-                        output_path = (
-                            file_output_dir
-                            / f"{Path(str(filename)).stem}_detection_{i:03d}_conf_{confidence:.3f}.png"
+                    # Optionally split by class
+                    if split_by_class and (
+                        "pred_class" in group.columns or "pred_label" in group.columns
+                    ):
+                        class_col = (
+                            "pred_label"
+                            if "pred_label" in group.columns
+                            else "pred_class"
                         )
-                        try:
-                            window = self._calculate_preview_window(
-                                src, bbox, bbox_buffer_pixels, patch_size
+                        class_groups = group.groupby(class_col)
+                    else:
+                        class_groups = [(None, group)]
+
+                    for cls_val, cls_group in class_groups:
+                        cls_dir = file_output_dir
+                        if split_by_class and cls_val is not None:
+                            cls_dir = file_output_dir / f"class_{cls_val}"
+                            cls_dir.mkdir(parents=True, exist_ok=True)
+
+                        for i, detection in cls_group.iterrows():
+                            bbox = detection["bbox_parsed"]
+                            confidence = detection["confidence"]
+                            suffix = (
+                                f"_cls_{detection.get('pred_label', detection.get('pred_class', 'na'))}"
+                                if split_by_class
+                                else ""
                             )
-                            if window is None:
-                                continue
-                            window_data = self._read_and_normalize_window_data(
-                                src, window, normalize_window
+                            output_path = (
+                                cls_dir
+                                / f"{Path(str(filename)).stem}_detection_{i:03d}_conf_{confidence:.3f}{suffix}.png"
                             )
-                            if window_data is None:
-                                continue
-                            self._save_png_crop(window_data, output_path)
-                        except Exception as inner_e:
-                            print(
-                                f"  Error processing detection index {i} for {filename}: {inner_e}"
-                            )
+                            try:
+                                window = self._calculate_preview_window(
+                                    src, bbox, bbox_buffer_pixels, patch_size
+                                )
+                                if window is None:
+                                    continue
+                                window_data = self._read_and_normalize_window_data(
+                                    src, window, normalize_window
+                                )
+                                if window_data is None:
+                                    continue
+                                self._save_png_crop(window_data, output_path)
+                            except Exception as inner_e:
+                                print(
+                                    f"  Error processing detection index {i} for {filename}: {inner_e}"
+                                )
             except Exception as e:
                 print(
                     f"[{self.class_name}] Error processing file {filename} for individual previews: {e}"
@@ -215,7 +282,7 @@ class EddyVisualizer:
 
     def _calculate_preview_window(
         self,
-        src: rasterio.io.DatasetReader,
+        src: rasterio.DatasetReader,
         bbox: Tuple[float, float, float, float],
         buffer: int,
         patch_size: int,

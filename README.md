@@ -211,6 +211,36 @@ python src/main.py mode=inference_only inference=timm_xgb \
   inference.output_dir=output/experiment_1
 ```
 
+### Ten-Class (TenGPP) SimCLR Inference
+
+Run the 10-class classifier and select which classes count as positives:
+
+```bash
+# Activate your environment first
+conda activate sar_eddy_env
+
+# Example: point to your 10-class checkpoint
+python src/main.py mode=inference_only inference=simclr_10class \
+  inference.geotiff_dir=data/processed \
+  inference.output_dir=output/ten_class \
+  inference.pretrain=model_checkpoints/10class_checkpoint.tar
+```
+
+
+Outputs now include pred_class in both the raw and merged CSVs. If you provide `inference.class_names`, a `pred_label` column will also be added.
+
+Optional: split previews and tiles into per-class folders by enabling `inference.split_preview_by_class=true`. When enabled, scene previews and saved tiles will be grouped by `pred_label` (if provided) or `pred_class`.
+
+Examples:
+
+```bash
+python src/main.py mode=inference_only inference=simclr_10class \
+  inference.geotiff_dir=data/processed \
+  inference.output_dir=output/ten_class \
+  inference.class_names='["pure ocean waves", "wind streaks", "micro convective cells", "rain cells", "biological slicks", "sea ice", "icebergs", "low wind area", "atmospheric front", "oceanic front"]' \
+  inference.split_preview_by_class=true
+```
+
 ### Large Granule Lists (Hydra-friendly)
 
 For very large batches (e.g., 10,000 granules), avoid pasting lists on the CLI or editing `config/hyp3/default.yaml`. Instead, create a **granule list config** and point Hydra at it:
