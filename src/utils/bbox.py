@@ -1,5 +1,5 @@
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import numpy as np
 import pandas as pd
@@ -59,11 +59,18 @@ def merge_csv_bboxes(
         merge_iou_threshold (float): IoU threshold for union-based merging. Default 0.3.
         post_nms_iou_threshold (float): IoU threshold for post-merge NMS. Default 0.1.
 
-    Returns:
-        Dict[str, List[Dict[str, Any]]]:
-            Mapping from filename to a list of output detections, each with:
-              - 'bbox': Tuple[float, float, float, float] for (xmin, ymin, xmax, ymax)
-              - 'confidence': float averaged over any merged detections
+        Class-awareness:
+            - If the CSV includes a 'pred_class' column (and optional 'pred_label'),
+                merging is performed per class to avoid fusing different classes.
+            - Output dictionaries will include 'pred_class' and 'pred_label' when
+                present in the input, allowing downstream consumers to persist class info.
+
+        Returns:
+                Dict[str, List[Dict[str, Any]]]:
+                        Mapping from filename to a list of output detections, each with:
+                            - 'bbox': Tuple[float, float, float, float] for (xmin, ymin, xmax, ymax)
+                            - 'confidence': float averaged over any merged detections
+                            - Optional 'pred_class' (int) and 'pred_label' (str)
     """
     # Attempt to read the CSV; return empty results on failure
     try:
@@ -83,35 +90,72 @@ def merge_csv_bboxes(
     # Parse each bbox into a shapely geometry for spatial operations
     df["shape"] = df["bbox"].apply(to_shapely)
     df = df[df["shape"].notnull()]
+    # Normalize class fields if present
+    has_class = "pred_class" in df.columns
+    has_label = "pred_label" in df.columns
+    if has_class:
+        # Coerce to integers when possible
+        df["pred_class"] = pd.to_numeric(df["pred_class"], errors="coerce").astype(
+            "Int64"
+        )
+        df = df[df["pred_class"].notnull()]
 
     results: Dict[str, List[Dict[str, Any]]] = {}
 
     # Process each image/tile separately
     for filename, group in df.groupby("filename"):
-        # Stage 1: Pre-merge NMS to suppress redundant windows
-        shapes = group["shape"].tolist()
-        scores = group["confidence"].to_numpy()
-        keep_indices = _nms_shapely(shapes, scores, nms_iou_threshold)
-        survivors = group.iloc[keep_indices]
+        out_detections: List[Dict[str, Any]] = []
 
-        # Stage 2: Union-based merging of boxes whose IoU exceeds merge_iou
-        detections: List[Dict[str, Any]] = []
-        for _, row in survivors.iterrows():
-            detections.append(
-                {"shape": row["shape"], "confidences": [row["confidence"]]}
-            )
-        merged = _union_merge_boxes(detections, merge_iou_threshold)
+        # If class column exists, operate per class to avoid cross-class merges
+        class_groups = group.groupby("pred_class") if has_class else [(None, group)]
 
-        # Stage 3: Post-merge NMS to clean up any overlapping merged extents
-        if merged:
-            merged_shapes = [box(*d["bbox"]) for d in merged]
-            merged_scores = np.array([d["confidence"] for d in merged])
-            final_keep = _nms_shapely(
-                merged_shapes, merged_scores, post_nms_iou_threshold
-            )
-            merged = [merged[i] for i in final_keep]
+        for class_id, cls_group in class_groups:
+            # Determine a representative label for this class_id if present
+            class_label: Optional[str] = None
+            if has_label and not cls_group["pred_label"].empty:
+                try:
+                    # Use the most frequent label; fallback to first
+                    class_label = (
+                        cls_group["pred_label"].mode().iloc[0]
+                        if not cls_group["pred_label"].mode().empty
+                        else str(cls_group["pred_label"].iloc[0])
+                    )
+                except Exception:
+                    class_label = str(cls_group["pred_label"].iloc[0])
 
-        results[filename] = merged
+            # Stage 1: Pre-merge NMS to suppress redundant windows
+            shapes = cast(List[BaseGeometry], cls_group["shape"].tolist())
+            scores = cls_group["confidence"].to_numpy()
+            keep_indices = _nms_shapely(shapes, scores, nms_iou_threshold)
+            survivors = cls_group.iloc[keep_indices]
+
+            # Stage 2: Union-based merging of boxes whose IoU exceeds merge_iou
+            detections: List[Dict[str, Any]] = []
+            for _, row in survivors.iterrows():
+                det: Dict[str, Any] = {
+                    "shape": row["shape"],
+                    "confidences": [row["confidence"]],
+                }
+                if has_class:
+                    det["pred_class"] = int(class_id)  # type: ignore[arg-type]
+                if has_label and class_label is not None:
+                    det["pred_label"] = class_label
+                detections.append(det)
+
+            merged = _union_merge_boxes(detections, merge_iou_threshold)
+
+            # Stage 3: Post-merge NMS to clean up any overlapping merged extents
+            if merged:
+                merged_shapes: List[BaseGeometry] = [box(*d["bbox"]) for d in merged]
+                merged_scores = np.array([d["confidence"] for d in merged])
+                final_keep = _nms_shapely(
+                    merged_shapes, merged_scores, post_nms_iou_threshold
+                )
+                merged = [merged[i] for i in final_keep]
+
+            out_detections.extend(merged)
+
+    results[str(filename)] = out_detections
 
     return results
 
@@ -198,6 +242,7 @@ def _union_merge_boxes(
         List[Dict[str, Any]]: Merged detections, each with:
             - 'bbox': Tuple[float, float, float, float]
             - 'confidence': float average of merged confidences
+            - Optional: 'pred_class' and 'pred_label' when provided
     """
     has_merged = True
     while has_merged:
@@ -222,13 +267,19 @@ def _union_merge_boxes(
                     j += 1
             i += 1
     # Format output with averaged confidence per merged shape
-    return [
-        {
+    merged_out: List[Dict[str, Any]] = []
+    for det in detections:
+        out: Dict[str, Any] = {
             "bbox": det["shape"].bounds,  # (xmin, ymin, xmax, ymax)
             "confidence": float(np.mean(det["confidences"])),
         }
-        for det in detections
-    ]
+        # Preserve class metadata when present
+        if "pred_class" in det:
+            out["pred_class"] = det["pred_class"]
+        if "pred_label" in det:
+            out["pred_label"] = det["pred_label"]
+        merged_out.append(out)
+    return merged_out
 
 
 def _calculate_latitude_aware_iou(box1: BaseGeometry, box2: BaseGeometry) -> float:

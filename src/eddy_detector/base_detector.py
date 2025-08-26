@@ -362,7 +362,7 @@ class BaseEddyDetector(abc.ABC):
             for filename, detections in merged_results.items():
                 for detection in detections:
                     # Convert bounding box to string for saving
-                    bbox_str = " ".join(map(str, detection["bbox"]))
+                    bbox_str = " ".join(map(str, detection.pop("bbox")))
                     merged_list.append(
                         {"filename": filename, bbox_col_name: bbox_str, **detection}
                     )
